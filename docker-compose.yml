@@ -1,0 +1,70 @@
+# Docker Compose for Splat Editor
+# Run with: docker-compose up -d
+
+version: '3.8'
+
+services:
+  # Backend API Server
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: splat-editor-backend
+    ports:
+      - "4270:4270"
+    volumes:
+      # Persist data
+      - ./backend/data:/app/data
+      # Mount env file
+      - ./backend/.env:/app/.env:ro
+    environment:
+      - NODE_ENV=production
+      - PORT=4270
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:4270/api/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis for job queue
+  redis:
+    image: redis:7-alpine
+    container_name: splat-editor-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Frontend (optional - can also run separately with npm run dev)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: splat-editor-frontend
+    ports:
+      - "4269:4269"
+    environment:
+      - VITE_API_URL=http://localhost:4270
+    depends_on:
+      - backend
+    restart: unless-stopped
+    profiles:
+      - full # Only run with --profile full
+
+volumes:
+  redis_data:
+
+
+networks:
+  default:
+    name: splat-editor-network

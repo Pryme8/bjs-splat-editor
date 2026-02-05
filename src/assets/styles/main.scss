@@ -1,0 +1,149 @@
+// Quantum Design System - Global Styles
+
+// Color Variables (matching Vuetify theme)
+$background-deep: #0D0D12;
+$background-surface: #1A1A24;
+$background-elevated: #252532;
+$border-subtle: #3A3A4A;
+$text-primary: #E8E8F0;
+$text-secondary: #9898A8;
+$text-muted: #5A5A6A;
+$accent-primary: #6B8AFF;
+$accent-secondary: #9D7AFF;
+$accent-tertiary: #4ECDC4;
+$warning: #FFB347;
+$error: #FF6B6B;
+
+// Typography
+$font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+
+// Base Styles
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: $background-deep;
+  color: $text-primary;
+}
+
+#app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+// Scrollbar Styling
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: $background-surface;
+}
+
+::-webkit-scrollbar-thumb {
+  background: $border-subtle;
+  border-radius: 4px;
+  
+  &:hover {
+    background: #4A4A5A;
+  }
+}
+
+// Utility Classes
+.mono {
+  font-family: $font-mono;
+}
+
+.text-muted {
+  color: $text-muted !important;
+}
+
+.text-secondary {
+  color: $text-secondary !important;
+}
+
+// Panel Styling
+.quantum-panel {
+  background: $background-surface;
+  border: 1px solid $border-subtle;
+  border-radius: 8px;
+}
+
+.quantum-panel-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid $border-subtle;
+  font-weight: 500;
+  font-size: 0.875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: $text-secondary;
+}
+
+.quantum-panel-content {
+  padding: 12px 16px;
+}
+
+// Numeric Input Styling
+.numeric-value {
+  font-family: $font-mono;
+  font-size: 0.875rem;
+  color: $accent-primary;
+}
+
+// Transitions
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.2s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.slide-enter-active,
+.slide-leave-active {
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.slide-enter-from,
+.slide-leave-to {
+  transform: translateX(-10px);
+  opacity: 0;
+}
+
+// Canvas Container
+.canvas-container {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: $background-deep;
+  
+  canvas {
+    width: 100% !important;
+    height: 100% !important;
+    outline: none;
+  }
+}
+
+// Loading Overlay
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba($background-deep, 0.8);
+  backdrop-filter: blur(4px);
+  z-index: 100;
+}

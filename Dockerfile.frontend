@@ -1,0 +1,20 @@
+# Frontend Dockerfile (optional)
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy source
+COPY . .
+
+# Build
+RUN npm run build
+
+# Serve with preview
+EXPOSE 4269
+CMD ["npm", "run", "preview", "--", "--port", "4269", "--host"]

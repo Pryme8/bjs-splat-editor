@@ -1,0 +1,28 @@
+{
+  "name": "bjs-splat-editor",
+  "version": "0.1.0",
+  "description": "Gaussian Splat Generator and Editor with Babylon.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc && vite build",
+    "preview": "vite preview",
+    "type-check": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "vue": "^3.4.21",
+    "@babylonjs/core": "^7.43.0",
+    "@babylonjs/loaders": "^7.43.0",
+    "vuetify": "^3.5.8",
+    "pinia": "^2.1.7",
+    "@mdi/font": "^7.4.47"
+  },
+  "devDependencies": {
+    "vite": "^5.4.14",
+    "typescript": "^5.7.3",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite-plugin-vuetify": "^2.0.4",
+    "vue-tsc": "^2.2.0",
+    "sass": "^1.83.4"
+  }
+}
