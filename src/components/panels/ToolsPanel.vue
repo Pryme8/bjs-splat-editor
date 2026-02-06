@@ -5,8 +5,8 @@ import type { BrushMode, GizmoType } from '@/stores/editorStore'
 
 const editor = useSplatEditor()
 
-// Combined tool type: gizmo types + brush + operations
-type ToolType = GizmoType | 'brush' | 'operations'
+// Combined tool type: gizmo types + brush + operations + clipping tools
+type ToolType = GizmoType | 'brush' | 'operations' | 'clipSphere' | 'clipBox'
 
 // Internal state for operations panel
 const _operationsSelected = ref(false)
@@ -23,6 +23,12 @@ const activeTool = computed<ToolType>(() => {
   if (editor.selection.value.brushEnabled) {
     return 'brush'
   }
+  if (editor.clipSphere.value.enabled) {
+    return 'clipSphere'
+  }
+  if (editor.clipBox.value.enabled) {
+    return 'clipBox'
+  }
   // Check if operations was manually selected
   if (_operationsSelected.value) {
     return 'operations'
@@ -35,18 +41,38 @@ function handleToolChange(tool: ToolType | undefined) {
   if (!tool) return
   
   if (tool === 'brush') {
-    // Selecting brush: disable gizmos, enable brush, close operations
+    // Selecting brush: disable gizmos, enable brush, close operations, disable clipping
     editor.setGizmo('none')
     editor.setSelectionBrushEnabled(true)
+    editor.setClipSphereEnabled(false)
+    editor.setClipBoxEnabled(false)
     _operationsSelected.value = false
   } else if (tool === 'operations') {
-    // Selecting operations: disable gizmos and brush, show operations panel
+    // Selecting operations: disable gizmos and brush, show operations panel, disable clipping
     editor.setGizmo('none')
     editor.setSelectionBrushEnabled(false)
+    editor.setClipSphereEnabled(false)
+    editor.setClipBoxEnabled(false)
     _operationsSelected.value = true
-  } else {
-    // Selecting a gizmo: disable brush, close operations, set gizmo
+  } else if (tool === 'clipSphere') {
+    // Selecting clip sphere: disable gizmos, brush, operations, clip box
+    editor.setGizmo('none')
     editor.setSelectionBrushEnabled(false)
+    editor.setClipBoxEnabled(false)
+    editor.setClipSphereEnabled(true)
+    _operationsSelected.value = false
+  } else if (tool === 'clipBox') {
+    // Selecting clip box: disable gizmos, brush, operations, clip sphere
+    editor.setGizmo('none')
+    editor.setSelectionBrushEnabled(false)
+    editor.setClipSphereEnabled(false)
+    editor.setClipBoxEnabled(true)
+    _operationsSelected.value = false
+  } else {
+    // Selecting a gizmo: disable brush, close operations, disable clipping, set gizmo
+    editor.setSelectionBrushEnabled(false)
+    editor.setClipSphereEnabled(false)
+    editor.setClipBoxEnabled(false)
     _operationsSelected.value = false
     editor.setGizmo(tool)
   }
@@ -65,19 +91,11 @@ function handleBrushModeChange(value: BrushMode | undefined) {
   }
 }
 
-function handleClipSphereEnabledChange(value: boolean | null) {
-  editor.setClipSphereEnabled(value === true)
-}
-
 function handleClipSphereRadiusChange(value: string | number) {
   const num = typeof value === 'string' ? parseFloat(value) : value
   if (!isNaN(num) && num > 0) {
     editor.setClipSphereRadius(num)
   }
-}
-
-function handleClipBoxEnabledChange(value: boolean | null) {
-  editor.setClipBoxEnabled(value === true)
 }
 </script>
 
@@ -243,41 +261,87 @@ function handleClipBoxEnabledChange(value: boolean | null) {
       <div class="section">
         <div class="section-title">Tools</div>
         
-        <v-btn-toggle
-          :model-value="activeTool"
-          @update:model-value="handleToolChange"
-          mandatory
-          density="compact"
-          class="gizmo-toggle"
-          :disabled="!editor.hasScene.value"
-        >
-          <v-btn value="none" size="small" title="Select">
+        <div class="tools-grid">
+          <v-btn 
+            :variant="activeTool === 'none' ? 'flat' : 'tonal'"
+            size="small" 
+            title="Select"
+            :disabled="!editor.hasScene.value"
+            @click="handleToolChange('none')"
+          >
             <v-icon size="small">mdi-cursor-default</v-icon>
           </v-btn>
-          <v-btn value="translate" size="small" title="Move">
+          <v-btn 
+            :variant="activeTool === 'translate' ? 'flat' : 'tonal'"
+            size="small" 
+            title="Move"
+            :disabled="!editor.hasScene.value"
+            @click="handleToolChange('translate')"
+          >
             <v-icon size="small">mdi-axis-arrow</v-icon>
           </v-btn>
           <v-btn 
-            value="rotate" 
+            :variant="activeTool === 'rotate' ? 'flat' : 'tonal'"
             size="small" 
             :title="editor.hasSelection.value ? 'Rotate (disabled with selection)' : 'Rotate'"
-            :disabled="editor.hasSelection.value"
+            :disabled="!editor.hasScene.value || editor.hasSelection.value"
+            @click="handleToolChange('rotate')"
           >
             <v-icon size="small">mdi-rotate-3d-variant</v-icon>
           </v-btn>
-          <v-btn value="scale" size="small" title="Scale">
+          <v-btn 
+            :variant="activeTool === 'scale' ? 'flat' : 'tonal'"
+            size="small" 
+            title="Scale"
+            :disabled="!editor.hasScene.value"
+            @click="handleToolChange('scale')"
+          >
             <v-icon size="small">mdi-resize</v-icon>
           </v-btn>
-          <v-btn value="brush" size="small" title="Selection Brush" color="info">
+          <v-btn 
+            :variant="activeTool === 'brush' ? 'flat' : 'tonal'"
+            :color="activeTool === 'brush' ? 'info' : undefined"
+            size="small" 
+            title="Selection Brush"
+            :disabled="!editor.hasScene.value"
+            @click="handleToolChange('brush')"
+          >
             <v-icon size="small">mdi-brush</v-icon>
           </v-btn>
-          <v-btn value="operations" size="small" title="Operations" color="secondary">
+          <v-btn 
+            :variant="activeTool === 'clipSphere' ? 'flat' : 'tonal'"
+            :color="activeTool === 'clipSphere' ? 'warning' : undefined"
+            size="small" 
+            title="Clip Sphere"
+            :disabled="!editor.hasScene.value || editor.hasSelection.value"
+            @click="handleToolChange('clipSphere')"
+          >
+            <v-icon size="small">mdi-sphere</v-icon>
+          </v-btn>
+          <v-btn 
+            :variant="activeTool === 'clipBox' ? 'flat' : 'tonal'"
+            :color="activeTool === 'clipBox' ? 'warning' : undefined"
+            size="small" 
+            title="Clip Box"
+            :disabled="!editor.hasScene.value || editor.hasSelection.value"
+            @click="handleToolChange('clipBox')"
+          >
+            <v-icon size="small">mdi-cube-outline</v-icon>
+          </v-btn>
+          <v-btn 
+            :variant="activeTool === 'operations' ? 'flat' : 'tonal'"
+            :color="activeTool === 'operations' ? 'secondary' : undefined"
+            size="small" 
+            title="Operations"
+            :disabled="!editor.hasScene.value"
+            @click="handleToolChange('operations')"
+          >
             <v-icon size="small">mdi-cog</v-icon>
           </v-btn>
-        </v-btn-toggle>
+        </div>
         
         <!-- Transform Space Toggle (shown for gizmos) -->
-        <template v-if="activeTool !== 'none' && activeTool !== 'brush' && activeTool !== 'operations'">
+        <template v-if="activeTool !== 'none' && activeTool !== 'brush' && activeTool !== 'operations' && activeTool !== 'clipSphere' && activeTool !== 'clipBox'">
           <div class="space-toggle">
             <span class="space-label">Space:</span>
             <v-btn-toggle
@@ -402,100 +466,8 @@ function handleClipBoxEnabledChange(value: boolean | null) {
           </div>
         </template>
         
-        <div class="gizmo-hint">
-          <template v-if="activeTool === 'none'">
-            Select a tool to begin
-          </template>
-          <template v-else-if="activeTool === 'translate'">
-            Drag arrows to move
-          </template>
-          <template v-else-if="activeTool === 'rotate'">
-            Drag rings to rotate
-          </template>
-          <template v-else-if="activeTool === 'scale'">
-            Drag handles to scale
-          </template>
-          <template v-else-if="activeTool === 'brush'">
-            Click and drag on splats to paint selection
-          </template>
-          <template v-else-if="activeTool === 'operations'">
-            Operations on selected splats
-          </template>
-        </div>
-      </div>
-      
-      <!-- Selection Section -->
-      <div class="section">
-        <div class="section-title">Selection</div>
-        
-        <!-- Selection Info and Actions -->
-        <div class="selection-info">
-          <v-icon size="small" class="mr-1" :color="editor.hasSelection.value ? 'info' : undefined">
-            mdi-selection
-          </v-icon>
-          <span>{{ editor.selectionCount.value.toLocaleString() }} splats selected</span>
-        </div>
-        
-        <div class="selection-actions">
-          <v-btn
-            size="x-small"
-            variant="text"
-            :disabled="!editor.hasScene.value"
-            @click="editor.selectAll"
-          >
-            Select All
-          </v-btn>
-          <v-btn
-            size="x-small"
-            variant="text"
-            :disabled="!editor.hasScene.value || !editor.hasSelection.value"
-            @click="editor.invertSelection"
-          >
-            Invert
-          </v-btn>
-          <v-btn
-            size="x-small"
-            variant="text"
-            :disabled="!editor.hasScene.value || !editor.hasSelection.value"
-            @click="editor.clearSelection"
-          >
-            Clear
-          </v-btn>
-        </div>
-        
-        <div class="selection-hint">
-          Double-right-click to clear selection
-        </div>
-      </div>
-      
-      <!-- Clipping Sphere Section -->
-      <div class="section">
-        <div class="section-title">Clipping Sphere</div>
-        
-        <v-tooltip 
-          :disabled="!editor.hasSelection.value" 
-          text="Clear selection to use clipping tools"
-          location="top"
-        >
-          <template #activator="{ props }">
-            <div class="toggle-row" v-bind="props">
-              <v-switch
-                :model-value="editor.clipSphere.value.enabled"
-                @update:model-value="handleClipSphereEnabledChange"
-                density="compact"
-                hide-details
-                color="warning"
-                :disabled="!editor.hasScene.value || editor.hasSelection.value"
-              />
-              <div class="toggle-label">
-                <v-icon size="small" class="mr-2" color="warning">mdi-sphere</v-icon>
-                Enable Clip Sphere
-              </div>
-            </div>
-          </template>
-        </v-tooltip>
-        
-        <template v-if="editor.clipSphere.value.enabled">
+        <!-- Clip Sphere Options (shown when clipSphere is active) -->
+        <template v-if="activeTool === 'clipSphere'">
           <div class="slider-row">
             <span class="slider-label">Radius</span>
             <v-slider
@@ -527,7 +499,7 @@ function handleClipBoxEnabledChange(value: boolean | null) {
           </div>
           
           <div class="center-inputs">
-            <span class="center-label">Center:</span>
+            <span class="center-label">Center (drag gizmo to move)</span>
             <div class="center-coords">
               <span class="coord-value">
                 X: {{ editor.clipSphere.value.center.x.toFixed(2) }}
@@ -561,36 +533,9 @@ function handleClipBoxEnabledChange(value: boolean | null) {
             of {{ editor.lastClipResult.value.originalCount.toLocaleString() }} splats
           </div>
         </template>
-      </div>
-      
-      <!-- Clipping Box Section -->
-      <div class="section">
-        <div class="section-title">Clipping Box</div>
         
-        <v-tooltip 
-          :disabled="!editor.hasSelection.value" 
-          text="Clear selection to use clipping tools"
-          location="top"
-        >
-          <template #activator="{ props }">
-            <div class="toggle-row" v-bind="props">
-              <v-switch
-                :model-value="editor.clipBox.value.enabled"
-                @update:model-value="handleClipBoxEnabledChange"
-                density="compact"
-                hide-details
-                color="info"
-                :disabled="!editor.hasScene.value || editor.hasSelection.value"
-              />
-              <div class="toggle-label">
-                <v-icon size="small" class="mr-2" color="info">mdi-cube-outline</v-icon>
-                Enable Clip Box
-              </div>
-            </div>
-          </template>
-        </v-tooltip>
-        
-        <template v-if="editor.clipBox.value.enabled">
+        <!-- Clip Box Options (shown when clipBox is active) -->
+        <template v-if="activeTool === 'clipBox'">
           <div class="size-inputs">
             <span class="size-label">Size</span>
             <div class="size-coords">
@@ -650,7 +595,7 @@ function handleClipBoxEnabledChange(value: boolean | null) {
           
           <v-btn
             block
-            color="info"
+            color="warning"
             variant="flat"
             size="small"
             prepend-icon="mdi-crop"
@@ -668,6 +613,77 @@ function handleClipBoxEnabledChange(value: boolean | null) {
             of {{ editor.lastClipResult.value.originalCount.toLocaleString() }} splats
           </div>
         </template>
+        
+        <div class="gizmo-hint">
+          <template v-if="activeTool === 'none'">
+            Select a tool to begin
+          </template>
+          <template v-else-if="activeTool === 'translate'">
+            Drag arrows to move
+          </template>
+          <template v-else-if="activeTool === 'rotate'">
+            Drag rings to rotate
+          </template>
+          <template v-else-if="activeTool === 'scale'">
+            Drag handles to scale
+          </template>
+          <template v-else-if="activeTool === 'brush'">
+            Click and drag on splats to paint selection
+          </template>
+          <template v-else-if="activeTool === 'clipSphere'">
+            Drag sphere to position, adjust radius, then apply
+          </template>
+          <template v-else-if="activeTool === 'clipBox'">
+            Drag box to position, adjust size, then apply
+          </template>
+          <template v-else-if="activeTool === 'operations'">
+            Operations on selected splats
+          </template>
+        </div>
+      </div>
+      
+      <!-- Selection Section -->
+      <div class="section">
+        <div class="section-title">Selection</div>
+        
+        <!-- Selection Info and Actions -->
+        <div class="selection-info">
+          <v-icon size="small" class="mr-1" :color="editor.hasSelection.value ? 'info' : undefined">
+            mdi-selection
+          </v-icon>
+          <span>{{ editor.selectionCount.value.toLocaleString() }} splats selected</span>
+        </div>
+        
+        <div class="selection-actions">
+          <v-btn
+            size="x-small"
+            variant="text"
+            :disabled="!editor.hasScene.value"
+            @click="editor.selectAll"
+          >
+            Select All
+          </v-btn>
+          <v-btn
+            size="x-small"
+            variant="text"
+            :disabled="!editor.hasScene.value || !editor.hasSelection.value"
+            @click="editor.invertSelection"
+          >
+            Invert
+          </v-btn>
+          <v-btn
+            size="x-small"
+            variant="text"
+            :disabled="!editor.hasScene.value || !editor.hasSelection.value"
+            @click="editor.clearSelection"
+          >
+            Clear
+          </v-btn>
+        </div>
+        
+        <div class="selection-hint">
+          Double-right-click to clear selection
+        </div>
       </div>
       
       <!-- Camera Section -->
@@ -770,24 +786,15 @@ function handleClipBoxEnabledChange(value: boolean | null) {
 .axis-y { color: #4ECDC4; font-weight: 600; }
 .axis-z { color: #6B8AFF; font-weight: 600; }
 
-.gizmo-toggle {
-  width: 100%;
+.tools-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(36px, 1fr));
+  gap: 6px;
   padding: 0 12px;
   
-  :deep(.v-btn-group) {
-    width: 100%;
-    flex-wrap: wrap;
-    gap: 4px;
-    
-    // Remove the connected button styling when wrapped
-    .v-btn {
-      border-radius: 4px !important;
-    }
-  }
-  
-  :deep(.v-btn) {
-    flex: 0 0 auto;
+  .v-btn {
     min-width: 36px;
+    margin: 0;
     
     &:disabled {
       opacity: 0.35;
