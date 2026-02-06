@@ -32,7 +32,7 @@ export interface JobConfig {
   depthModelSize?: 'small' | 'base' | 'large'
   depthFloaterFilterEnabled?: boolean
   depthFloaterThreshold?: number
-  // AI Enhancement: Learned Features (SuperPoint + LightGlue)
+  // AI Enhancement: Learned Features (DISK + LightGlue)
   learnedFeaturesEnabled?: boolean
   learnedFeaturesMaxKeypoints?: number
 }
@@ -85,12 +85,27 @@ type ProgressCallback = (progress: {
   colmapPreviewReady?: boolean
 }) => void
 
+// Console message types
+export type LogLevel = 'info' | 'warn' | 'error'
+
+export interface ConsoleMessage {
+  timestamp: number
+  level: LogLevel
+  message: string
+  source?: string
+}
+
+type ConsoleCallback = (msg: ConsoleMessage) => void
+type ConsoleHistoryCallback = (msgs: ConsoleMessage[]) => void
+
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4270'
 const WS_URL = API_URL.replace('http', 'ws')
 
 class BackendApiService {
   private ws: WebSocket | null = null
   private progressCallbacks: Map<string, ProgressCallback> = new Map()
+  private consoleCallback: ConsoleCallback | null = null
+  private consoleHistoryCallback: ConsoleHistoryCallback | null = null
   private reconnectTimeout: number | null = null
 
   /**
@@ -341,6 +356,17 @@ class BackendApiService {
             } else {
               console.warn('[BackendApi] No callback registered for job:', data.jobId)
             }
+          } else if (data.type === 'console' && this.consoleCallback) {
+            // Single console message
+            this.consoleCallback({
+              timestamp: data.timestamp,
+              level: data.level,
+              message: data.message,
+              source: data.source
+            })
+          } else if (data.type === 'console_history' && this.consoleHistoryCallback) {
+            // Batch of historical messages on subscribe
+            this.consoleHistoryCallback(data.messages || [])
           }
         } catch (error) {
           console.warn('[BackendApi] Failed to parse WebSocket message:', error)
@@ -403,6 +429,39 @@ class BackendApiService {
       this.ws.send(JSON.stringify({
         type: 'unsubscribe',
         jobId
+      }))
+    }
+  }
+
+  /**
+   * Subscribe to console output stream
+   */
+  SubscribeToConsole(
+    onMessage: ConsoleCallback,
+    onHistory: ConsoleHistoryCallback
+  ): void {
+    this.consoleCallback = onMessage
+    this.consoleHistoryCallback = onHistory
+    
+    // Send subscribe message
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'subscribe_console'
+      }))
+    }
+  }
+
+  /**
+   * Unsubscribe from console output stream
+   */
+  UnsubscribeFromConsole(): void {
+    this.consoleCallback = null
+    this.consoleHistoryCallback = null
+    
+    // Send unsubscribe message
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: 'unsubscribe_console'
       }))
     }
   }

@@ -7,7 +7,7 @@ export type JobStatus =
   | 'uploading'
   | 'preprocessing'
   | 'depth_estimation'
-  | 'learned_features'  // SuperPoint + LightGlue extraction
+  | 'learned_features'  // DISK + LightGlue extraction
   | 'sfm_features'
   | 'sfm_matching'
   | 'sfm_reconstruction'
@@ -51,7 +51,7 @@ export interface JobConfig {
   depthFloaterFilterEnabled?: boolean  // Use depth maps to filter floaters (default: true when depth enabled)
   depthFloaterThreshold?: number    // Depth difference threshold for floater detection (default: 0.15)
   // Learned feature matching options (AI-enhanced)
-  learnedFeaturesEnabled?: boolean  // Use SuperPoint + LightGlue instead of SIFT (default: false)
+  learnedFeaturesEnabled?: boolean  // Use DISK + LightGlue instead of SIFT (default: false)
   learnedFeaturesMaxKeypoints?: number  // Max keypoints per image (default: 2048)
 }
 

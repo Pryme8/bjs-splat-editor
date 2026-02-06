@@ -57,7 +57,7 @@ export async function checkLearnedFeaturesAvailable(): Promise<boolean> {
 }
 
 /**
- * Extract features and compute matches using SuperPoint + LightGlue
+ * Extract features and compute matches using DISK + LightGlue
  * 
  * @param imageDir Directory containing input images
  * @param outputDb Path for the output COLMAP database
@@ -96,9 +96,10 @@ export async function extractLearnedFeatures(
       args.push('--sequential')
     }
 
-    console.log(`[LearnedFeatures] Running: python ${args.join(' ')}`)
+    console.log(`[LearnedFeatures] Running: python -u ${args.join(' ')}`)
 
-    const proc = spawn('python', args, {
+    // Use -u flag for unbuffered output so tqdm progress shows in real-time
+    const proc = spawn('python', ['-u', ...args], {
       stdio: ['pipe', 'pipe', 'pipe']
     })
 
@@ -113,22 +114,25 @@ export async function extractLearnedFeatures(
       const text = data.toString()
       stderr += text
       
+      // Log ALL stderr output to console (will be broadcast to clients)
+      // Split by lines and log each non-empty line
+      for (const line of text.split('\n')) {
+        const trimmed = line.trim()
+        if (trimmed) {
+          // Always log to console for streaming to frontend
+          console.log(`[LearnedFeatures] ${trimmed}`)
+        }
+      }
+      
       // Parse tqdm progress: "Features:  50%|#####     | 12/25"
       // or "Matching:  50%|#####     | 150/300"
       const progressMatch = text.match(/(Features|Matching):\s*(\d+)%\|[^|]+\|\s*(\d+)\/(\d+)/)
-      if (progressMatch) {
+      if (progressMatch && onProgress) {
         const phase = progressMatch[1].toLowerCase() as 'features' | 'matching'
         const current = parseInt(progressMatch[3])
         const total = parseInt(progressMatch[4])
         const message = `${progressMatch[1]}: ${current}/${total}`
-        
-        if (onProgress) {
-          onProgress(message, phase, current, total)
-        }
-        console.log(`[LearnedFeatures] ${message}`)
-      } else if (text.trim() && !text.includes('|')) {
-        // Log non-progress messages (loading, warnings, etc.)
-        console.log(`[LearnedFeatures] ${text.trim()}`)
+        onProgress(message, phase, current, total)
       }
     })
 

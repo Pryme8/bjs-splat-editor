@@ -324,7 +324,7 @@ def add_keypoints(conn: sqlite3.Connection, image_id: int, keypoints: np.ndarray
     cursor = conn.cursor()
     
     # COLMAP expects [N, 6]: x, y, scale, orientation, response, octave
-    # We only have x, y from SuperPoint, pad the rest
+    # We only have x, y from DISK, pad the rest
     n_kpts = keypoints.shape[0]
     kpts_full = np.zeros((n_kpts, 6), dtype=np.float32)
     kpts_full[:, :2] = keypoints
@@ -342,7 +342,7 @@ def add_descriptors(conn: sqlite3.Connection, image_id: int, descriptors: np.nda
     cursor = conn.cursor()
     
     # Convert to uint8 (COLMAP uses L2-normalized uint8 descriptors)
-    # SuperPoint outputs float descriptors, normalize and convert
+    # DISK outputs float descriptors, normalize and convert
     desc_normalized = descriptors / (np.linalg.norm(descriptors, axis=1, keepdims=True) + 1e-8)
     desc_uint8 = ((desc_normalized + 1) * 127.5).clip(0, 255).astype(np.uint8)
     
@@ -578,7 +578,7 @@ def process_images(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SuperPoint + LightGlue feature extraction for COLMAP"
+        description="DISK + LightGlue feature extraction for COLMAP"
     )
     parser.add_argument(
         "--input_dir", type=str, required=True,

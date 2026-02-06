@@ -183,7 +183,7 @@ export const useGeneratorStore = defineStore('generator', () => {
         depthModelSize: config.value.depthModelSize,
         depthFloaterFilterEnabled: config.value.depthFloaterFilterEnabled,
         depthFloaterThreshold: config.value.depthFloaterThreshold,
-        // AI Enhancement: Learned Features (SuperPoint + LightGlue)
+        // AI Enhancement: Learned Features (DISK + LightGlue)
         learnedFeaturesEnabled: config.value.learnedFeaturesEnabled,
         learnedFeaturesMaxKeypoints: config.value.learnedFeaturesMaxKeypoints
       }
@@ -380,6 +380,11 @@ export const useGeneratorStore = defineStore('generator', () => {
         const appStore = useAppStore()
         await appStore.loadFromBlob(blob, `generated_${jobId}.ply`, false)
         
+        // Final defensive cleanup - ensure no preview mesh remains
+        // (handles race condition with concurrent intermediate loads)
+        babylon.removeSplat('preview')
+        sceneStore.clearPreview()
+        
         // Parse splat data (simplified - just store blob URL)
         result.value = {
           positions: new Float32Array(0), // Will load from blob
@@ -530,6 +535,10 @@ export const useGeneratorStore = defineStore('generator', () => {
       const appStore = useAppStore()
       await appStore.loadFromBlob(blob, `accepted_iter${iteration}.ply`, false)
       
+      // Dispose the preview mesh explicitly (the loaded blob WAS the preview, now it's final)
+      babylon.removeSplat('preview')
+      sceneStore.clearPreview()
+      
       // Estimate splat count from blob size
       const arrayBuffer = await blob.arrayBuffer()
       const splatCount = Math.floor(arrayBuffer.byteLength / 250)
@@ -591,12 +600,13 @@ export const useGeneratorStore = defineStore('generator', () => {
     lastIntermediateFetchTime.value = 0
     colmapPreviewFetched.value = false
     
-    // Clear preview from scene store
+    // Clear preview from scene store and dispose preview mesh
     const sceneStore = useSceneStore()
+    const babylon = useBabylon()
+    babylon.removeSplat('preview')
     sceneStore.clearPreview()
     
     // Clear COLMAP preview visualization
-    const babylon = useBabylon()
     babylon.clearColmapPreview()
   }
 

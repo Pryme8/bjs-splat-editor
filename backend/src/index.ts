@@ -15,9 +15,13 @@ import { jobsRouter } from './routes/jobs.js'
 import { healthRouter } from './routes/health.js'
 import { setupWebSocket } from './websocket/index.js'
 import { initializeJobQueue } from './services/jobQueue.js'
+import { setupConsoleLogging } from './services/consoleLogger.js'
 
 // Load environment variables
 dotenv.config()
+
+// Initialize console logging early to capture all output
+setupConsoleLogging()
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = process.env.PORT || 4270

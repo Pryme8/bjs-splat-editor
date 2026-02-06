@@ -4,12 +4,16 @@ import AppToolbar from './components/layout/AppToolbar.vue'
 import AppSidebar from './components/layout/AppSidebar.vue'
 import AppRightPanel from './components/layout/AppRightPanel.vue'
 import AppCanvas from './components/layout/AppCanvas.vue'
+import ConsolePanel from './components/panels/ConsolePanel.vue'
 import { useSplatEditor } from './composables/useSplatEditor'
 import { useAppStore } from './stores/appStore'
 
 const sidebarOpen = ref(true)
 const editor = useSplatEditor()
 const appStore = useAppStore()
+
+// Console panel height when open
+const consolePanelHeight = ref(180)
 
 // Keyboard shortcuts
 function handleKeyDown(e: KeyboardEvent) {
@@ -29,6 +33,11 @@ function handleKeyDown(e: KeyboardEvent) {
     e.preventDefault()
     editor.redo()
   }
+  // Ctrl+` or F12: Toggle console panel
+  else if ((e.ctrlKey && e.key === '`') || e.key === 'F12') {
+    e.preventDefault()
+    appStore.toggleConsolePanel()
+  }
 }
 
 onMounted(() => {
@@ -45,18 +54,31 @@ onUnmounted(() => {
     <AppToolbar 
       @toggle-sidebar="sidebarOpen = !sidebarOpen" 
       @toggle-right-panel="appStore.toggleRightPanel"
+      @toggle-console="appStore.toggleConsolePanel"
     />
     
     <v-main class="app-main">
-      <div class="app-layout">
-        <transition name="slide-left">
-          <AppSidebar v-if="sidebarOpen" />
-        </transition>
+      <div class="app-content">
+        <div class="app-layout">
+          <transition name="slide-left">
+            <AppSidebar v-if="sidebarOpen" />
+          </transition>
+          
+          <AppCanvas />
+          
+          <transition name="slide-right">
+            <AppRightPanel v-if="appStore.showRightPanel" />
+          </transition>
+        </div>
         
-        <AppCanvas />
-        
-        <transition name="slide-right">
-          <AppRightPanel v-if="appStore.showRightPanel" />
+        <transition name="slide-up">
+          <div 
+            v-if="appStore.showConsolePanel" 
+            class="console-wrapper"
+            :style="{ height: consolePanelHeight + 'px' }"
+          >
+            <ConsolePanel />
+          </div>
         </transition>
       </div>
     </v-main>
@@ -77,12 +99,29 @@ onUnmounted(() => {
   }
 }
 
+.app-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
 .app-layout {
   display: flex;
   flex: 1;
   height: 100%;
   max-height: 100%;
   min-height: 0;
+  overflow: hidden;
+}
+
+.console-wrapper {
+  flex-shrink: 0;
+  min-height: 100px;
+  max-height: 50vh;
   overflow: hidden;
 }
 
@@ -106,6 +145,17 @@ onUnmounted(() => {
 .slide-right-enter-from,
 .slide-right-leave-to {
   transform: translateX(100%);
+  opacity: 0;
+}
+
+.slide-up-enter-active,
+.slide-up-leave-active {
+  transition: transform 0.2s ease, opacity 0.2s ease, height 0.2s ease;
+}
+
+.slide-up-enter-from,
+.slide-up-leave-to {
+  transform: translateY(100%);
   opacity: 0;
 }
 </style>

@@ -6,6 +6,7 @@ import { useSplatEditor } from '@/composables/useSplatEditor'
 const emit = defineEmits<{
   toggleSidebar: []
   toggleRightPanel: []
+  toggleConsole: []
 }>()
 
 const appStore = useAppStore()
@@ -117,6 +118,15 @@ function handleExport(format: 'ply' | 'splat') {
     </v-btn-group>
     
     <v-divider vertical class="mx-2" />
+    
+    <v-btn
+      icon="mdi-console"
+      size="small"
+      variant="text"
+      :color="appStore.showConsolePanel ? 'primary' : undefined"
+      title="Toggle Console (Ctrl+` or F12)"
+      @click="emit('toggleConsole')"
+    />
     
     <v-btn
       :icon="appStore.showRightPanel ? 'mdi-dock-right' : 'mdi-dock-right'"

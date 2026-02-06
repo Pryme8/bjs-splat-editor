@@ -18,6 +18,7 @@ export const useAppStore = defineStore('app', () => {
   
   // Panel visibility
   const showRightPanel = ref(true)
+  const showConsolePanel = ref(false)  // Start collapsed
 
   const hasScene = computed(() => currentFile.value !== null)
   const canUndo = computed(() => undoStack.value.length > 0)
@@ -110,12 +111,21 @@ export const useAppStore = defineStore('app', () => {
   function setRightPanelVisible(visible: boolean) {
     showRightPanel.value = visible
   }
+  
+  function toggleConsolePanel() {
+    showConsolePanel.value = !showConsolePanel.value
+  }
+  
+  function setConsolePanelVisible(visible: boolean) {
+    showConsolePanel.value = visible
+  }
 
   return {
     currentFile,
     isLoading,
     error,
     showRightPanel,
+    showConsolePanel,
     hasScene,
     canUndo,
     canRedo,
@@ -126,6 +136,8 @@ export const useAppStore = defineStore('app', () => {
     undo,
     redo,
     toggleRightPanel,
-    setRightPanelVisible
+    setRightPanelVisible,
+    toggleConsolePanel,
+    setConsolePanelVisible
   }
 })

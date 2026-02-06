@@ -2,21 +2,27 @@
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { useGeneratorStore } from '@/stores/generatorStore'
 import { useSceneStore } from '@/stores/sceneStore'
+import { useVideoFrameStore } from '@/stores/videoFrameStore'
 import { useGenerator } from '@/composables/useGenerator'
 import { useBabylon } from '@/composables/useBabylon'
 import { SceneTypeLabels, SceneTypeDescriptions, type SceneType } from '@/generator/types'
+import VideoFrameModal from '@/components/modals/VideoFrameModal.vue'
 
 const generatorStore = useGeneratorStore()
 const sceneStore = useSceneStore()
+const videoFrameStore = useVideoFrameStore()
 const generator = useGenerator()
 const babylon = useBabylon()
+
+// Supported video MIME types
+const VIDEO_MIME_TYPES = ['video/mp4', 'video/webm', 'video/quicktime', 'video/x-msvideo']
 
 const webgpuChecked = ref(false)
 const browserSupportsWebGPU = ref(false)
 const checkingBackend = ref(true)
 const showClearSceneDialog = ref(false)
 
-const MAX_IMAGES = 100
+const MAX_IMAGES = 300
 
 // Check capabilities on mount
 onMounted(async () => {
@@ -117,23 +123,61 @@ const progressColor = computed(() => {
   }
 })
 
+
 function handleImageUpload() {
   const input = document.createElement('input')
   input.type = 'file'
-  input.accept = 'image/*'
+  input.accept = 'image/*,video/*'
   input.multiple = true
   input.onchange = (e) => {
     const files = (e.target as HTMLInputElement).files
     if (files) {
-      const currentCount = generatorStore.images.length
-      const remaining = MAX_IMAGES - currentCount
-      if (remaining <= 0) return
-      
-      const filesToAdd = Array.from(files).slice(0, remaining)
-      generatorStore.addImages(filesToAdd)
+      processUploadedFiles(Array.from(files))
     }
   }
   input.click()
+}
+
+// Process uploaded files - detect video vs images
+function processUploadedFiles(files: File[]) {
+  // Check for video files first
+  const videoFile = files.find(f => VIDEO_MIME_TYPES.includes(f.type) || f.type.startsWith('video/'))
+  
+  if (videoFile) {
+    // Open video frame modal
+    videoFrameStore.setVideo(videoFile)
+    videoFrameStore.openModal()
+    return
+  }
+  
+  // Handle images
+  const imageFiles = files.filter(f => f.type.startsWith('image/'))
+  if (imageFiles.length > 0) {
+    const currentCount = generatorStore.images.length
+    const remaining = MAX_IMAGES - currentCount
+    if (remaining <= 0) return
+    
+    const filesToAdd = imageFiles.slice(0, remaining)
+    generatorStore.addImages(filesToAdd)
+  }
+}
+
+// Handle frames extracted from video
+function handleFramesExtracted(frames: File[]) {
+  if (frames.length > 0) {
+    const currentCount = generatorStore.images.length
+    const remaining = MAX_IMAGES - currentCount
+    
+    const framesToAdd = frames.slice(0, remaining)
+    generatorStore.addImages(framesToAdd)
+    
+    console.log(`[GeneratorPanel] Added ${framesToAdd.length} frames from video`)
+  }
+}
+
+// Handle video modal close
+function handleVideoModalClose() {
+  videoFrameStore.reset()
 }
 
 const isDragging = ref(false)
@@ -163,15 +207,7 @@ function handleDrop(e: DragEvent) {
   
   const files = e.dataTransfer?.files
   if (files && files.length > 0) {
-    const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'))
-    if (imageFiles.length > 0) {
-      const currentCount = generatorStore.images.length
-      const remaining = MAX_IMAGES - currentCount
-      if (remaining <= 0) return
-      
-      const filesToAdd = imageFiles.slice(0, remaining)
-      generatorStore.addImages(filesToAdd)
-    }
+    processUploadedFiles(Array.from(files))
   }
 }
 
@@ -393,7 +429,8 @@ function clearAndGenerate() {
             @dragleave="handleDragLeave"
           >
             <v-icon size="32" :color="isDragging ? 'primary' : 'grey-darken-1'">mdi-image-multiple</v-icon>
-            <p class="mt-2">{{ isDragging ? 'Drop to add images' : 'Drop images here or click to browse' }}</p>
+            <p class="mt-2">{{ isDragging ? 'Drop to add' : 'Drop images or video' }}</p>
+            <p class="drop-hint text-muted">Click to browse</p>
           </div>
 
           <v-virtual-scroll
@@ -544,7 +581,7 @@ function clearAndGenerate() {
           </div>
           
           <p v-if="generatorStore.config.learnedFeaturesEnabled" class="hint-text mb-2">
-            Uses SuperPoint + LightGlue instead of SIFT for better matching
+            Uses DISK + LightGlue instead of SIFT for better matching
           </p>
           
           <div v-if="generatorStore.config.learnedFeaturesEnabled">
@@ -841,6 +878,12 @@ function clearAndGenerate() {
         </v-card-actions>
       </v-card>
     </v-dialog>
+    
+    <!-- Video Frame Extraction Modal -->
+    <VideoFrameModal
+      @frames-extracted="handleFramesExtracted"
+      @close="handleVideoModalClose"
+    />
   </div>
 </template>
 
@@ -970,6 +1013,11 @@ function clearAndGenerate() {
     border-color: #6B8AFF;
     background: rgba(#6B8AFF, 0.1);
     color: #6B8AFF;
+  }
+  
+  .drop-hint {
+    font-size: 0.75rem;
+    margin-top: 4px;
   }
 }
 

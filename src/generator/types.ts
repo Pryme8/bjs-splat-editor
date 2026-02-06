@@ -111,7 +111,7 @@ export interface GenerationConfig {
   depthModelSize?: DepthModelSize
   depthFloaterFilterEnabled?: boolean
   depthFloaterThreshold?: number
-  // AI Enhancement: Learned Feature Matching (SuperPoint + LightGlue)
+  // AI Enhancement: Learned Feature Matching (DISK + LightGlue)
   learnedFeaturesEnabled?: boolean
   learnedFeaturesMaxKeypoints?: number
 }

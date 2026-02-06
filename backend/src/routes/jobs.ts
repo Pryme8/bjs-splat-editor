@@ -46,7 +46,7 @@ const upload = multer({
   storage,
   limits: {
     fileSize: 50 * 1024 * 1024, // 50MB per file
-    files: 100 // Max 100 images
+    files: 300 // Max 300 images
   },
   fileFilter: (req, file, cb) => {
     const allowedTypes = ['image/jpeg', 'image/png', 'image/webp']
@@ -75,7 +75,7 @@ router.get('/', async (req, res) => {
 /**
  * POST /api/jobs - Create a new job and upload images
  */
-router.post('/', upload.array('images', 100), async (req, res) => {
+router.post('/', upload.array('images', 300), async (req, res) => {
   try {
     const files = req.files as Express.Multer.File[]
     
@@ -103,7 +103,7 @@ router.post('/', upload.array('images', 100), async (req, res) => {
       depthModelSize: (req.body.depthModelSize as 'small' | 'base' | 'large') || 'small',
       depthFloaterFilterEnabled: req.body.depthFloaterFilterEnabled !== 'false',  // Default true when depth enabled
       depthFloaterThreshold: req.body.depthFloaterThreshold ? parseFloat(req.body.depthFloaterThreshold) : undefined,
-      // AI Enhancement: Learned Features (SuperPoint + LightGlue)
+      // AI Enhancement: Learned Features (DISK + LightGlue)
       learnedFeaturesEnabled: req.body.learnedFeaturesEnabled === 'true',
       learnedFeaturesMaxKeypoints: req.body.learnedFeaturesMaxKeypoints ? parseInt(req.body.learnedFeaturesMaxKeypoints) : undefined
     }

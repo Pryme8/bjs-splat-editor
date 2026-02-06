@@ -27,7 +27,7 @@ interface ColmapOptions {
   outputDir: string
   sceneType?: SceneType
   onProgress: (progress: Partial<JobProgress>) => void
-  // Learned features (SuperPoint + LightGlue)
+  // Learned features (DISK + LightGlue)
   learnedFeaturesEnabled?: boolean
   learnedFeaturesMaxKeypoints?: number
 }
@@ -341,9 +341,9 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
   console.log(`[COLMAP] Matcher type: ${settings.matcherType}`)
   console.log(`[COLMAP] Learned features: ${learnedFeaturesEnabled ? 'DISK + LightGlue' : 'disabled (using SIFT)'}`)
 
-  // Check if we should use learned features (SuperPoint + LightGlue)
+  // Check if we should use learned features (DISK + LightGlue)
   if (learnedFeaturesEnabled) {
-    // Use SuperPoint + LightGlue for feature extraction and matching
+    // Use DISK + LightGlue for feature extraction and matching
     const { extractLearnedFeatures, checkLearnedFeaturesAvailable } = await import('./learnedFeatures.js')
     
     const available = await checkLearnedFeaturesAvailable()

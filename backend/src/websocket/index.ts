@@ -1,10 +1,11 @@
 /**
- * WebSocket handler for real-time job progress
+ * WebSocket handler for real-time job progress and console streaming
  */
 
 import { WebSocketServer, WebSocket } from 'ws'
 import type { JobProgress } from '../types/index.js'
 import { cancelJob } from '../services/jobManager.js'
+import { setBroadcastFunction, getMessageBuffer, type ConsoleMessage } from '../services/consoleLogger.js'
 
 // Map of jobId -> Set of WebSocket clients
 const jobSubscribers = new Map<string, Set<WebSocket>>()
@@ -12,8 +13,31 @@ const jobSubscribers = new Map<string, Set<WebSocket>>()
 const clientOwnedJobs = new Map<WebSocket, Set<string>>()
 // All connected clients
 const allClients = new Set<WebSocket>()
+// Clients subscribed to console output
+const consoleSubscribers = new Set<WebSocket>()
+
+/**
+ * Broadcast console message to all subscribed clients
+ */
+function broadcastConsoleMessage(msg: ConsoleMessage): void {
+  if (consoleSubscribers.size === 0) return
+  
+  const message = JSON.stringify({
+    type: 'console',
+    ...msg
+  })
+  
+  for (const client of consoleSubscribers) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message)
+    }
+  }
+}
 
 export function setupWebSocket(wss: WebSocketServer): void {
+  // Wire up console logger broadcast
+  setBroadcastFunction(broadcastConsoleMessage)
+  
   wss.on('connection', (ws, req) => {
     console.log('[WebSocket] Client connected')
     allClients.add(ws)
@@ -30,6 +54,7 @@ export function setupWebSocket(wss: WebSocketServer): void {
     ws.on('close', async () => {
       console.log('[WebSocket] Client disconnected')
       allClients.delete(ws)
+      consoleSubscribers.delete(ws)
       
       // Cancel any jobs owned by this client
       const ownedJobs = clientOwnedJobs.get(ws)
@@ -99,6 +124,29 @@ function handleMessage(ws: WebSocket, message: any): void {
 
     case 'ping':
       ws.send(JSON.stringify({ type: 'pong' }))
+      break
+
+    case 'subscribe_console':
+      // Subscribe to console output
+      consoleSubscribers.add(ws)
+      console.log('[WebSocket] Client subscribed to console')
+      
+      // Send current buffer history
+      const history = getMessageBuffer()
+      ws.send(JSON.stringify({
+        type: 'console_history',
+        messages: history
+      }))
+      
+      ws.send(JSON.stringify({
+        type: 'subscribed_console'
+      }))
+      break
+
+    case 'unsubscribe_console':
+      // Unsubscribe from console output
+      consoleSubscribers.delete(ws)
+      console.log('[WebSocket] Client unsubscribed from console')
       break
 
     default:
