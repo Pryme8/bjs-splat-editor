@@ -27,6 +27,8 @@ import { RotationGizmo } from '@babylonjs/core/Gizmos/rotationGizmo'
 import { PositionGizmo } from '@babylonjs/core/Gizmos/positionGizmo'
 import { ScaleGizmo } from '@babylonjs/core/Gizmos/scaleGizmo'
 import { UtilityLayerRenderer } from '@babylonjs/core/Rendering/utilityLayerRenderer'
+import { SceneLoader } from '@babylonjs/core/Loading/sceneLoader'
+import '@babylonjs/loaders/SPLAT'
 import { useAppStore } from '@/stores/appStore'
 import { useSceneStore } from '@/stores/sceneStore'
 import { useEditorStore, type GizmoType, type Transform } from '@/stores/editorStore'
@@ -3054,16 +3056,28 @@ export function useBabylon() {
         }
       }
 
-      // Create new Gaussian Splatting mesh FIRST (before disposing old one)
-      const newSplat = new GaussianSplattingMesh(name, null, scene)
-      console.log('[Babylon] GaussianSplattingMesh created, loading file...')
+      // Determine file extension for proper loader selection
+      const extension = name.split('.').pop()?.toLowerCase() || 'splat'
+      const pluginExtension = '.' + extension
       
+      console.log('[Babylon] Loading splat via SceneLoader, extension:', pluginExtension)
+      
+      // Use SceneLoader.ImportMeshAsync for proper format detection (.spz, .ply, .splat, .sog)
+      let newSplat: GaussianSplattingMesh
       try {
-        await newSplat.loadFileAsync(url)
+        const result = await SceneLoader.ImportMeshAsync('', '', url, scene, undefined, pluginExtension)
+        console.log('[Babylon] SceneLoader result:', result.meshes.length, 'meshes loaded')
+        
+        if (result.meshes.length === 0) {
+          throw new Error('No meshes loaded from file')
+        }
+        
+        // The first mesh should be our GaussianSplattingMesh
+        newSplat = result.meshes[0] as GaussianSplattingMesh
+        newSplat.name = name
         console.log('[Babylon] File loaded successfully')
       } catch (loadError) {
-        // Clean up the partially created mesh on load failure
-        newSplat.dispose()
+        console.error('[Babylon] SceneLoader failed:', loadError)
         throw loadError
       }
       
