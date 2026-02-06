@@ -2,11 +2,14 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import AppToolbar from './components/layout/AppToolbar.vue'
 import AppSidebar from './components/layout/AppSidebar.vue'
+import AppRightPanel from './components/layout/AppRightPanel.vue'
 import AppCanvas from './components/layout/AppCanvas.vue'
 import { useSplatEditor } from './composables/useSplatEditor'
+import { useAppStore } from './stores/appStore'
 
 const sidebarOpen = ref(true)
 const editor = useSplatEditor()
+const appStore = useAppStore()
 
 // Keyboard shortcuts
 function handleKeyDown(e: KeyboardEvent) {
@@ -39,15 +42,22 @@ onUnmounted(() => {
 
 <template>
   <v-app>
-    <AppToolbar @toggle-sidebar="sidebarOpen = !sidebarOpen" />
+    <AppToolbar 
+      @toggle-sidebar="sidebarOpen = !sidebarOpen" 
+      @toggle-right-panel="appStore.toggleRightPanel"
+    />
     
     <v-main class="app-main">
       <div class="app-layout">
-        <transition name="slide">
+        <transition name="slide-left">
           <AppSidebar v-if="sidebarOpen" />
         </transition>
         
         <AppCanvas />
+        
+        <transition name="slide-right">
+          <AppRightPanel v-if="appStore.showRightPanel" />
+        </transition>
       </div>
     </v-main>
   </v-app>
@@ -74,5 +84,28 @@ onUnmounted(() => {
   max-height: 100%;
   min-height: 0;
   overflow: hidden;
+}
+
+// Slide transitions for panels
+.slide-left-enter-active,
+.slide-left-leave-active {
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.slide-left-enter-from,
+.slide-left-leave-to {
+  transform: translateX(-100%);
+  opacity: 0;
+}
+
+.slide-right-enter-active,
+.slide-right-leave-active {
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+
+.slide-right-enter-from,
+.slide-right-leave-to {
+  transform: translateX(100%);
+  opacity: 0;
 }
 </style>

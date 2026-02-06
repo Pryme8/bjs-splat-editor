@@ -39,6 +39,12 @@ export const useGeneratorStore = defineStore('generator', () => {
   // Watch intermediate results and update the 3D view
   watch(intermediateResult, async (newResult) => {
     if (newResult) {
+      // Don't load intermediate results if generation has completed
+      const stage = progress.value?.stage
+      if (stage === 'complete' || stage === 'error' || stage === 'cancelled') {
+        console.log('[GeneratorStore] Skipping intermediate load - generation already ended:', stage)
+        return
+      }
       console.log('[GeneratorStore] Loading intermediate result into viewer, iteration:', newResult.iteration)
       const appStore = useAppStore()
       await appStore.loadFromBlob(newResult.blob, `preview_${newResult.iteration}.ply`)
@@ -165,11 +171,21 @@ export const useGeneratorStore = defineStore('generator', () => {
         trainingMode: trainingMode.value,
         iterations: config.value.iterations,
         resolution: config.value.resolution,
+        // Scene type for COLMAP optimization
+        sceneType: config.value.sceneType,
         // Cleanup settings
         cleanupEnabled: config.value.cleanupEnabled,
         cleanupMinOpacity: config.value.cleanupMinOpacity,
         cleanupMaxScalePercentile: config.value.cleanupMaxScalePercentile,
-        cleanupSorStdDevs: config.value.cleanupSorStdDevs
+        cleanupSorStdDevs: config.value.cleanupSorStdDevs,
+        // AI Enhancement: Depth Anything
+        depthEstimationEnabled: config.value.depthEstimationEnabled,
+        depthModelSize: config.value.depthModelSize,
+        depthFloaterFilterEnabled: config.value.depthFloaterFilterEnabled,
+        depthFloaterThreshold: config.value.depthFloaterThreshold,
+        // AI Enhancement: Learned Features (SuperPoint + LightGlue)
+        learnedFeaturesEnabled: config.value.learnedFeaturesEnabled,
+        learnedFeaturesMaxKeypoints: config.value.learnedFeaturesMaxKeypoints
       }
 
       const response = await BackendApi.CreateJob(images.value, jobConfig)
@@ -348,15 +364,17 @@ export const useGeneratorStore = defineStore('generator', () => {
         
         // Clear preview state and intermediate results
         const sceneStore = useSceneStore()
-        sceneStore.clearPreview()
         intermediateResult.value = null
         lastIntermediateIteration.value = 0
         lastIntermediateFetchTime.value = 0
         
-        // Clear COLMAP preview visualization
+        // Clear COLMAP preview visualization and dispose preview splat mesh
         const babylon = useBabylon()
         babylon.clearColmapPreview()
         colmapPreviewFetched.value = false
+        
+        // Explicitly dispose the preview splat mesh before loading final result
+        babylon.removeSplat('preview')
         
         // Load final result as non-preview
         const appStore = useAppStore()

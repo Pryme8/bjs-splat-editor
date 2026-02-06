@@ -97,7 +97,15 @@ router.post('/', upload.array('images', 100), async (req, res) => {
       cleanupEnabled: req.body.cleanupEnabled !== 'false',  // Default true
       cleanupMinOpacity: req.body.cleanupMinOpacity ? parseFloat(req.body.cleanupMinOpacity) : undefined,
       cleanupMaxScalePercentile: req.body.cleanupMaxScalePercentile ? parseFloat(req.body.cleanupMaxScalePercentile) : undefined,
-      cleanupSorStdDevs: req.body.cleanupSorStdDevs ? parseFloat(req.body.cleanupSorStdDevs) : undefined
+      cleanupSorStdDevs: req.body.cleanupSorStdDevs ? parseFloat(req.body.cleanupSorStdDevs) : undefined,
+      // AI Enhancement: Depth Anything
+      depthEstimationEnabled: req.body.depthEstimationEnabled === 'true',
+      depthModelSize: (req.body.depthModelSize as 'small' | 'base' | 'large') || 'small',
+      depthFloaterFilterEnabled: req.body.depthFloaterFilterEnabled !== 'false',  // Default true when depth enabled
+      depthFloaterThreshold: req.body.depthFloaterThreshold ? parseFloat(req.body.depthFloaterThreshold) : undefined,
+      // AI Enhancement: Learned Features (SuperPoint + LightGlue)
+      learnedFeaturesEnabled: req.body.learnedFeaturesEnabled === 'true',
+      learnedFeaturesMaxKeypoints: req.body.learnedFeaturesMaxKeypoints ? parseInt(req.body.learnedFeaturesMaxKeypoints) : undefined
     }
 
     // Create job

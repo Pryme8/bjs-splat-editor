@@ -20,11 +20,21 @@ export interface JobConfig {
   iterations?: number
   resolution?: number
   shDegree?: number
+  // Scene type for COLMAP optimization
+  sceneType?: 'auto' | 'building360' | 'interior' | 'landscape'
   // Cleanup options
   cleanupEnabled?: boolean
   cleanupMinOpacity?: number
   cleanupMaxScalePercentile?: number
   cleanupSorStdDevs?: number
+  // AI Enhancement: Depth Anything
+  depthEstimationEnabled?: boolean
+  depthModelSize?: 'small' | 'base' | 'large'
+  depthFloaterFilterEnabled?: boolean
+  depthFloaterThreshold?: number
+  // AI Enhancement: Learned Features (SuperPoint + LightGlue)
+  learnedFeaturesEnabled?: boolean
+  learnedFeaturesMaxKeypoints?: number
 }
 
 export interface BackendHealth {
@@ -134,6 +144,16 @@ class BackendApiService {
       if (config.cleanupMinOpacity !== undefined) formData.append('cleanupMinOpacity', config.cleanupMinOpacity.toString())
       if (config.cleanupMaxScalePercentile !== undefined) formData.append('cleanupMaxScalePercentile', config.cleanupMaxScalePercentile.toString())
       if (config.cleanupSorStdDevs !== undefined) formData.append('cleanupSorStdDevs', config.cleanupSorStdDevs.toString())
+      
+      // AI Enhancement: Depth Anything
+      if (config.depthEstimationEnabled !== undefined) formData.append('depthEstimationEnabled', config.depthEstimationEnabled.toString())
+      if (config.depthModelSize) formData.append('depthModelSize', config.depthModelSize)
+      if (config.depthFloaterFilterEnabled !== undefined) formData.append('depthFloaterFilterEnabled', config.depthFloaterFilterEnabled.toString())
+      if (config.depthFloaterThreshold !== undefined) formData.append('depthFloaterThreshold', config.depthFloaterThreshold.toString())
+      
+      // AI Enhancement: Learned Features
+      if (config.learnedFeaturesEnabled !== undefined) formData.append('learnedFeaturesEnabled', config.learnedFeaturesEnabled.toString())
+      if (config.learnedFeaturesMaxKeypoints !== undefined) formData.append('learnedFeaturesMaxKeypoints', config.learnedFeaturesMaxKeypoints.toString())
 
       const response = await fetch(`${API_URL}/api/jobs`, {
         method: 'POST',

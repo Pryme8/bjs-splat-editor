@@ -3,21 +3,85 @@
  * 
  * Pipeline:
  * 1. Preprocess images
- * 2. Run COLMAP for Structure from Motion (camera poses)
- * 3. Run OpenSplat for Gaussian Splatting training
+ * 2. (Optional) Run Depth Anything for depth estimation
+ * 3. Run COLMAP for Structure from Motion (camera poses)
+ * 4. Run OpenSplat for Gaussian Splatting training
+ * 5. (Optional) Depth-based floater filtering
+ * 6. Standard cleanup
  */
 
 import path from 'path'
 import fs from 'fs/promises'
-import type { Job, JobConfig, JobProgress, TrainingResult } from '../types/index.js'
+import type { Job, JobConfig, JobProgress, TrainingResult, CameraInfo } from '../types/index.js'
 import { updateJobStatus, completeJob, failJob, updateJob } from './jobManager.js'
 import { runColmapPipeline, checkColmapAvailable } from './colmap.js'
-import { trainWithOpenSplat, checkOpenSplatAvailable, checkOpenSplatGPU } from './opensplat.js'
+import { trainWithOpenSplat, checkOpenSplatAvailable, checkOpenSplatGPU, getOpenSplatGPUInfo } from './opensplat.js'
 import { cleanupPly, DefaultCleanupConfig, type CleanupConfig } from './plyCleanup.js'
+import { checkDepthEstimationAvailable, estimateDepth, type DepthSummary } from './depthEstimation.js'
+import { detectFloaters, removeFloatersFromPly, type Camera } from './depthFloaterFilter.js'
 
 // Cache for resolved capabilities
 let cachedGpuAvailable: boolean | null = null
 let cachedOpenSplatAvailable: boolean | null = null
+
+/**
+ * Extract splat positions from PLY file
+ * Returns Float32Array with [x0,y0,z0, x1,y1,z1, ...] format
+ */
+function extractSplatPositions(plyContent: Buffer): Float32Array | null {
+  try {
+    // Find header end
+    const headerEnd = plyContent.indexOf(Buffer.from('end_header\n'))
+    if (headerEnd === -1) return null
+    
+    const headerStr = plyContent.slice(0, headerEnd).toString('utf-8')
+    const dataStart = headerEnd + 'end_header\n'.length
+    
+    // Parse vertex count
+    const vertexMatch = headerStr.match(/element vertex (\d+)/)
+    if (!vertexMatch) return null
+    const vertexCount = parseInt(vertexMatch[1], 10)
+    
+    // Check if binary or ASCII
+    const isBinary = headerStr.includes('binary_little_endian')
+    
+    if (isBinary) {
+      // Parse property offsets - positions are typically first 3 floats
+      const dataLength = plyContent.length - dataStart
+      const bytesPerVertex = Math.floor(dataLength / vertexCount)
+      
+      // Assume positions are first 3 float32 values (standard PLY format)
+      const positions = new Float32Array(vertexCount * 3)
+      const view = new DataView(plyContent.buffer, plyContent.byteOffset + dataStart)
+      
+      for (let i = 0; i < vertexCount; i++) {
+        const offset = i * bytesPerVertex
+        positions[i * 3] = view.getFloat32(offset, true)
+        positions[i * 3 + 1] = view.getFloat32(offset + 4, true)
+        positions[i * 3 + 2] = view.getFloat32(offset + 8, true)
+      }
+      
+      return positions
+    } else {
+      // ASCII format
+      const dataStr = plyContent.slice(dataStart).toString('utf-8')
+      const lines = dataStr.trim().split('\n')
+      const positions = new Float32Array(vertexCount * 3)
+      
+      for (let i = 0; i < Math.min(vertexCount, lines.length); i++) {
+        const parts = lines[i].trim().split(/\s+/)
+        positions[i * 3] = parseFloat(parts[0])
+        positions[i * 3 + 1] = parseFloat(parts[1])
+        positions[i * 3 + 2] = parseFloat(parts[2])
+      }
+      
+      return positions
+    }
+  } catch (e) {
+    console.error('[TrainingWorker] Failed to extract splat positions:', e)
+    return null
+  }
+}
 
 interface TrainingJobData {
   jobId: string
@@ -102,6 +166,73 @@ export async function processTrainingJob(
       message: `Prepared ${imageFiles.length} images for processing`
     })
 
+    // Optional: Run Depth Anything for depth estimation
+    let depthSummary: DepthSummary | null = null
+    const depthDir = path.join(outputDir, 'depth')
+    
+    // Debug: Log depth config
+    console.log(`[TrainingWorker] Depth AI config: enabled=${config.depthEstimationEnabled}, model=${config.depthModelSize}, filter=${config.depthFloaterFilterEnabled}`)
+    
+    if (config.depthEstimationEnabled) {
+      const depthAvailable = await checkDepthEstimationAvailable()
+      
+      if (depthAvailable) {
+        onProgress({
+          jobId,
+          status: 'depth_estimation',
+          progress: 11,
+          message: 'Running AI depth estimation (Depth Anything)...'
+        })
+        
+        try {
+          depthSummary = await estimateDepth(
+            colmapImagesDir,
+            depthDir,
+            {
+              modelSize: config.depthModelSize || 'small',
+              saveVisualization: true
+            },
+            (line) => {
+              if (line.includes('%') || line.includes('Estimating')) {
+                onProgress({
+                  jobId,
+                  status: 'depth_estimation',
+                  progress: 12,
+                  message: `Depth estimation: ${line.substring(0, 60)}...`
+                })
+              }
+            },
+            jobId
+          )
+          
+          console.log(`[TrainingWorker] Depth estimation complete: ${depthSummary.successful}/${depthSummary.total_images} images`)
+          
+          onProgress({
+            jobId,
+            status: 'depth_estimation',
+            progress: 14,
+            message: `Depth maps generated for ${depthSummary.successful} images`
+          })
+        } catch (depthError) {
+          console.warn(`[TrainingWorker] Depth estimation failed, continuing without:`, depthError)
+          onProgress({
+            jobId,
+            status: 'preprocessing',
+            progress: 14,
+            message: 'Depth estimation failed, continuing without depth filtering'
+          })
+        }
+      } else {
+        console.log('[TrainingWorker] Depth estimation not available, skipping')
+        onProgress({
+          jobId,
+          status: 'preprocessing',
+          progress: 14,
+          message: 'Depth estimation not available (Python/dependencies missing)'
+        })
+      }
+    }
+
     // Run COLMAP SfM pipeline
     onProgress({
       jobId,
@@ -110,10 +241,19 @@ export async function processTrainingJob(
       message: 'Running Structure from Motion (COLMAP)...'
     })
 
+    // Log learned features config
+    if (config.learnedFeaturesEnabled) {
+      console.log(`[TrainingWorker] Learned features config: enabled=${config.learnedFeaturesEnabled}, maxKeypoints=${config.learnedFeaturesMaxKeypoints || 2048}`)
+    }
+
     const colmapResult = await runColmapPipeline({
       jobId,
       imagesDir: colmapImagesDir,
       outputDir,
+      sceneType: config.sceneType,
+      // AI Enhancement: Learned Features
+      learnedFeaturesEnabled: config.learnedFeaturesEnabled,
+      learnedFeaturesMaxKeypoints: config.learnedFeaturesMaxKeypoints,
       onProgress: (partial) => {
         onProgress({
           jobId,
@@ -135,17 +275,32 @@ export async function processTrainingJob(
       colmapPreviewReady: true  // Signal frontend to fetch and display COLMAP preview
     })
 
-    // Determine if GPU is available
-    const gpuAvailable = await checkOpenSplatGPU()
+    // Get detailed GPU info
+    const gpuInfo = await getOpenSplatGPUInfo()
+    const gpuAvailable = gpuInfo.nvidiaGpuDetected
     const useGpu = config.trainingMode === 'gpu' || (config.trainingMode === 'auto' && gpuAvailable)
     
     const modeLabel = useGpu ? 'GPU' : 'CPU'
+    
+    // Log GPU info and any warnings
+    if (gpuInfo.gpuName) {
+      console.log(`[TrainingWorker] GPU detected: ${gpuInfo.gpuName} (CUDA ${gpuInfo.cudaVersion || 'unknown'})`)
+    }
+    if (gpuInfo.warning) {
+      console.warn(`[TrainingWorker] GPU Warning: ${gpuInfo.warning}`)
+    }
+    
+    let initMessage = `Starting OpenSplat training (${modeLabel})...`
+    // Add warning hint for newer GPUs
+    if (gpuInfo.warning && useGpu) {
+      initMessage = `Starting OpenSplat training... (Note: Pre-built binaries may use CPU)`
+    }
     
     onProgress({
       jobId,
       status: 'training_init',
       progress: 78,
-      message: `Starting OpenSplat training (${modeLabel})...`
+      message: initMessage
     })
 
     // Run OpenSplat training
@@ -169,16 +324,90 @@ export async function processTrainingJob(
       }
     })
 
-    // Post-processing: Cleanup PLY to remove floaters
+    // Post-processing: Depth-based floater filtering (if depth maps available)
+    let finalSplatCount = result.splatCount
+    const shouldUseDepthFilter = config.depthEstimationEnabled && 
+                                  (config.depthFloaterFilterEnabled !== false) && 
+                                  depthSummary && 
+                                  depthSummary.successful > 0
+
+    if (shouldUseDepthFilter && result.plyPath && colmapResult.cameras.length > 0) {
+      onProgress({
+        jobId,
+        status: 'depth_filtering',
+        progress: 93,
+        message: 'Running AI-assisted floater detection...',
+        splatCount: result.splatCount
+      })
+
+      try {
+        // Read splat positions from PLY
+        const plyContent = await fs.readFile(result.plyPath)
+        const splatPositions = extractSplatPositions(plyContent)
+        
+        if (splatPositions) {
+          // Convert COLMAP cameras to floater filter format
+          const cameras: Camera[] = colmapResult.cameras.map((cam: CameraInfo) => ({
+            id: cam.id,
+            position: cam.position,
+            rotation: cam.rotation,
+            focalLength: cam.params[0] || 1000,  // fx from intrinsics
+            width: cam.width,
+            height: cam.height,
+            imageName: cam.imageName
+          }))
+
+          const floaterResult = await detectFloaters(
+            splatPositions,
+            cameras,
+            depthDir,
+            depthSummary!,
+            {
+              depthThreshold: config.depthFloaterThreshold || 0.15,
+              minCamerasAgreeing: Math.max(2, Math.floor(cameras.length * 0.3))
+            }
+          )
+
+          if (floaterResult.floatersDetected > 0) {
+            const depthFilteredPath = result.plyPath.replace('.ply', '_depth_filtered.ply')
+            const filterStats = await removeFloatersFromPly(
+              result.plyPath,
+              depthFilteredPath,
+              new Set(floaterResult.floaterIndices)
+            )
+            
+            // Replace with filtered version
+            await fs.rename(depthFilteredPath, result.plyPath)
+            finalSplatCount = filterStats.newCount
+            
+            console.log(`[TrainingWorker] Depth filtering: ${filterStats.originalCount} -> ${finalSplatCount} splats`)
+            
+            onProgress({
+              jobId,
+              status: 'depth_filtering',
+              progress: 95,
+              message: `AI depth filter removed ${floaterResult.floatersDetected} floaters`,
+              splatCount: finalSplatCount
+            })
+          } else {
+            console.log('[TrainingWorker] Depth filtering found no floaters')
+          }
+        }
+      } catch (depthFilterError) {
+        console.warn(`[TrainingWorker] Depth filtering failed:`, depthFilterError)
+        // Continue with original file
+      }
+    }
+
+    // Post-processing: Standard cleanup to remove remaining floaters
     onProgress({
       jobId,
       status: 'exporting',
       progress: 96,
-      message: 'Cleaning up splats (removing floaters)...',
-      splatCount: result.splatCount
+      message: 'Running standard floater cleanup...',
+      splatCount: finalSplatCount
     })
 
-    let finalSplatCount = result.splatCount
     const cleanupConfig: CleanupConfig = {
       minOpacity: config.cleanupMinOpacity ?? DefaultCleanupConfig.minOpacity,
       maxScalePercentile: config.cleanupMaxScalePercentile ?? DefaultCleanupConfig.maxScalePercentile,
@@ -193,20 +422,21 @@ export async function processTrainingJob(
         
         // Replace original with cleaned version
         await fs.rename(cleanedPath, result.plyPath)
+        const removedByCleanup = finalSplatCount - cleanupStats.finalCount
         finalSplatCount = cleanupStats.finalCount
         
-        console.log(`[TrainingWorker] Cleanup complete: ${cleanupStats.originalCount} -> ${finalSplatCount} splats`)
+        console.log(`[TrainingWorker] Cleanup complete: removed ${removedByCleanup} more splats`)
         
         onProgress({
           jobId,
           status: 'exporting',
           progress: 98,
-          message: `Cleanup removed ${cleanupStats.originalCount - finalSplatCount} floaters`,
+          message: `Cleanup removed ${removedByCleanup} additional floaters`,
           splatCount: finalSplatCount
         })
       } catch (cleanupError) {
-        console.warn(`[TrainingWorker] Cleanup failed, using original:`, cleanupError)
-        // Continue with original file if cleanup fails
+        console.warn(`[TrainingWorker] Cleanup failed, using current version:`, cleanupError)
+        // Continue with current file if cleanup fails
       }
     }
 

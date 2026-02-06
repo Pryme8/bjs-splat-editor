@@ -106,6 +106,14 @@ export const useSceneStore = defineStore('scene', () => {
     }
   }
 
+  function updateSplatCount(splatCount: number) {
+    // Update the first non-preview object's splat count
+    const obj = objects.value.find(o => !o.isPreview)
+    if (obj) {
+      obj.splatCount = splatCount
+    }
+  }
+
   function clearAll() {
     objects.value = []
     clearSelection()
@@ -121,6 +129,7 @@ export const useSceneStore = defineStore('scene', () => {
     addObject,
     addOrUpdatePreview,
     updatePreviewSplatCount,
+    updateSplatCount,
     clearPreview,
     removeObject,
     selectObject,

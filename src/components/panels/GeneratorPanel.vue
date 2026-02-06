@@ -1,16 +1,22 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { useGeneratorStore } from '@/stores/generatorStore'
+import { useSceneStore } from '@/stores/sceneStore'
 import { useGenerator } from '@/composables/useGenerator'
 import { useBabylon } from '@/composables/useBabylon'
+import { SceneTypeLabels, SceneTypeDescriptions, type SceneType } from '@/generator/types'
 
 const generatorStore = useGeneratorStore()
+const sceneStore = useSceneStore()
 const generator = useGenerator()
 const babylon = useBabylon()
 
 const webgpuChecked = ref(false)
 const browserSupportsWebGPU = ref(false)
 const checkingBackend = ref(true)
+const showClearSceneDialog = ref(false)
+
+const MAX_IMAGES = 100
 
 // Check capabilities on mount
 onMounted(async () => {
@@ -43,6 +49,19 @@ const generatorModeLabel = computed(() => {
   return 'Browser (WebGPU)'
 })
 
+// Scene type options for dropdown
+const sceneTypeOptions = computed(() => {
+  return Object.entries(SceneTypeLabels).map(([value, label]) => ({
+    value: value as SceneType,
+    title: label
+  }))
+})
+
+const currentSceneTypeHint = computed(() => {
+  const sceneType = generatorStore.config.sceneType || 'auto'
+  return SceneTypeDescriptions[sceneType]
+})
+
 async function recheckBackend() {
   checkingBackend.value = true
   await generatorStore.checkBackendAvailable()
@@ -57,24 +76,16 @@ onBeforeUnmount(() => {
   imageUrls.value.clear()
 })
 
-// Auto-load result to scene when generation completes
+// Focus camera when generation completes (generatorStore already loads the result)
 watch(() => generatorStore.currentStage, async (stage, prevStage) => {
   if (stage === 'complete' && prevStage !== 'complete') {
-    console.log('[Generator] Generation complete, auto-loading to scene...')
-    try {
-      await generator.loadResultToScene('Generated Splats')
-      console.log('[Generator] Successfully loaded to scene')
-      
-      // Wait a frame for the splat to be ready, then focus camera
-      setTimeout(() => {
-        console.log('[Generator] Focusing camera on generated splat...')
-        babylon.focusCamera()
-      }, 100)
-    } catch (e) {
-      console.error('[Generator] Failed to load to scene:', e)
-      // Show debug cube on failure
-      babylon.showDebugCube(true)
-    }
+    console.log('[Generator] Generation complete')
+    // generatorStore.handleProgressUpdate already loads the final result via appStore.loadFromBlob
+    // Just focus the camera after a brief delay for the splat to be ready
+    setTimeout(() => {
+      console.log('[Generator] Focusing camera on generated splat...')
+      babylon.focusCamera()
+    }, 100)
   }
 })
 
@@ -114,7 +125,12 @@ function handleImageUpload() {
   input.onchange = (e) => {
     const files = (e.target as HTMLInputElement).files
     if (files) {
-      generatorStore.addImages(Array.from(files))
+      const currentCount = generatorStore.images.length
+      const remaining = MAX_IMAGES - currentCount
+      if (remaining <= 0) return
+      
+      const filesToAdd = Array.from(files).slice(0, remaining)
+      generatorStore.addImages(filesToAdd)
     }
   }
   input.click()
@@ -149,7 +165,12 @@ function handleDrop(e: DragEvent) {
   if (files && files.length > 0) {
     const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'))
     if (imageFiles.length > 0) {
-      generatorStore.addImages(imageFiles)
+      const currentCount = generatorStore.images.length
+      const remaining = MAX_IMAGES - currentCount
+      if (remaining <= 0) return
+      
+      const filesToAdd = imageFiles.slice(0, remaining)
+      generatorStore.addImages(filesToAdd)
     }
   }
 }
@@ -202,6 +223,32 @@ function downloadPly() {
 function downloadSplat() {
   const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '')
   generator.downloadAsSplat(`splats-${timestamp}.splat`)
+}
+
+// Check if there are existing splats before generating
+function handleGenerateClick() {
+  // Check for non-preview splats in the scene
+  const existingSplats = sceneStore.objects.filter(o => !o.isPreview)
+  if (existingSplats.length > 0) {
+    showClearSceneDialog.value = true
+  } else {
+    startGeneration()
+  }
+}
+
+function startGeneration() {
+  showClearSceneDialog.value = false
+  // Reset loaded result tracking to allow fresh load
+  generator.resetLoadedResult()
+  generatorStore.startGeneration()
+}
+
+function clearAndGenerate() {
+  showClearSceneDialog.value = false
+  babylon.clearAllSplats()
+  // Reset loaded result tracking to allow fresh load
+  generator.resetLoadedResult()
+  generatorStore.startGeneration()
 }
 </script>
 
@@ -304,11 +351,35 @@ function downloadSplat() {
             </template>
           </p>
         </div>
+
+        <!-- Scene Type Selection -->
+        <div v-if="generatorStore.backendAvailable" class="section">
+          <div class="section-header">Scene Type</div>
+          
+          <v-select
+            :model-value="generatorStore.config.sceneType || 'auto'"
+            @update:model-value="v => generatorStore.updateConfig({ sceneType: v })"
+            :items="sceneTypeOptions"
+            item-value="value"
+            item-title="title"
+            density="compact"
+            variant="outlined"
+            hide-details
+            class="scene-type-select"
+          />
+
+          <p class="mode-hint">
+            {{ currentSceneTypeHint }}
+          </p>
+        </div>
+
         <!-- Image Upload Section -->
-        <div class="section">
+        <div class="section image-section">
           <div class="section-header">
             <span>Input Images</span>
-            <span class="image-count mono">{{ generatorStore.images.length }}</span>
+            <span class="image-count mono" :class="{ 'at-limit': generatorStore.images.length >= MAX_IMAGES }">
+              {{ generatorStore.images.length }} / {{ MAX_IMAGES }}
+            </span>
           </div>
           
           <div 
@@ -325,24 +396,36 @@ function downloadSplat() {
             <p class="mt-2">{{ isDragging ? 'Drop to add images' : 'Drop images here or click to browse' }}</p>
           </div>
 
-          <div v-else class="image-grid">
-            <div
-              v-for="(img, index) in generatorStore.images"
-              :key="index"
-              class="image-thumb"
-            >
-              <img :src="getImageUrl(img)" :alt="img.name" />
-              <v-btn
-                icon="mdi-close"
-                size="x-small"
-                variant="flat"
-                color="error"
-                class="remove-btn"
-                @click="removeImageAtIndex(index)"
-                :disabled="generatorStore.isGenerating"
-              />
-            </div>
-          </div>
+          <v-virtual-scroll
+            v-else
+            :items="generatorStore.images"
+            :height="180"
+            item-height="72"
+            class="image-scroller"
+            :class="{ 'drop-zone--active': isDragging }"
+            @drop="handleDrop"
+            @dragover="handleDragOver"
+            @dragenter="handleDragEnter"
+            @dragleave="handleDragLeave"
+          >
+            <template #default="{ item, index }">
+              <div class="image-row">
+                <div class="image-thumb">
+                  <img :src="getImageUrl(item)" :alt="item.name" />
+                  <v-btn
+                    icon="mdi-close"
+                    size="x-small"
+                    variant="flat"
+                    color="error"
+                    class="remove-btn"
+                    @click="removeImageAtIndex(index)"
+                    :disabled="generatorStore.isGenerating"
+                  />
+                </div>
+                <span class="image-name">{{ item.name }}</span>
+              </div>
+            </template>
+          </v-virtual-scroll>
           
           <div class="upload-actions">
             <v-btn
@@ -350,7 +433,7 @@ function downloadSplat() {
               variant="outlined"
               size="small"
               @click="handleImageUpload"
-              :disabled="generatorStore.isGenerating"
+              :disabled="generatorStore.isGenerating || generatorStore.images.length >= MAX_IMAGES"
             >
               Add Images
             </v-btn>
@@ -367,7 +450,7 @@ function downloadSplat() {
           
           <p class="hint">
             <v-icon size="12" class="mr-1">mdi-information-outline</v-icon>
-            Minimum 3 images required. More images = better results.
+            {{ generatorStore.images.length >= MAX_IMAGES ? 'Maximum images reached.' : 'Minimum 3 images required. More images = better results.' }}
           </p>
         </div>
         
@@ -391,6 +474,97 @@ function downloadSplat() {
             />
           </div>
 
+          <!-- AI Enhancement Settings -->
+          <div class="subsection-header mt-3">AI Enhancement</div>
+          
+          <div class="setting-row">
+            <span class="setting-label">Depth AI</span>
+            <v-switch
+              :model-value="generatorStore.config.depthEstimationEnabled ?? false"
+              @update:model-value="v => generatorStore.updateConfig({ depthEstimationEnabled: v ?? undefined })"
+              hide-details
+              density="compact"
+              color="success"
+              :disabled="generatorStore.isGenerating"
+            />
+          </div>
+          
+          <p v-if="generatorStore.config.depthEstimationEnabled" class="hint-text mb-2">
+            Uses Depth Anything V2 to detect and remove floaters
+          </p>
+          
+          <div v-if="generatorStore.config.depthEstimationEnabled">
+            <div class="setting-row">
+              <span class="setting-label">Model Size</span>
+              <v-select
+                :model-value="generatorStore.config.depthModelSize || 'small'"
+                @update:model-value="v => generatorStore.updateConfig({ depthModelSize: v })"
+                :items="[
+                  { value: 'small', title: 'Small (Fast)' },
+                  { value: 'base', title: 'Base (Balanced)' },
+                  { value: 'large', title: 'Large (Best)' }
+                ]"
+                item-value="value"
+                item-title="title"
+                density="compact"
+                variant="outlined"
+                hide-details
+                class="setting-select"
+                :disabled="generatorStore.isGenerating"
+              />
+            </div>
+            
+            <div class="setting-row">
+              <span class="setting-label">Filter Threshold</span>
+              <v-slider
+                :model-value="generatorStore.config.depthFloaterThreshold ?? 0.15"
+                @update:model-value="v => generatorStore.updateConfig({ depthFloaterThreshold: v })"
+                :min="0.05"
+                :max="0.3"
+                :step="0.01"
+                hide-details
+                density="compact"
+                thumb-label
+                class="setting-slider"
+                :disabled="generatorStore.isGenerating"
+              />
+            </div>
+          </div>
+          
+          <div class="setting-row mt-3">
+            <span class="setting-label">Learned Features</span>
+            <v-switch
+              :model-value="generatorStore.config.learnedFeaturesEnabled ?? false"
+              @update:model-value="v => generatorStore.updateConfig({ learnedFeaturesEnabled: v ?? undefined })"
+              hide-details
+              density="compact"
+              color="success"
+              :disabled="generatorStore.isGenerating"
+            />
+          </div>
+          
+          <p v-if="generatorStore.config.learnedFeaturesEnabled" class="hint-text mb-2">
+            Uses SuperPoint + LightGlue instead of SIFT for better matching
+          </p>
+          
+          <div v-if="generatorStore.config.learnedFeaturesEnabled">
+            <div class="setting-row">
+              <span class="setting-label">Max Keypoints</span>
+              <v-slider
+                :model-value="generatorStore.config.learnedFeaturesMaxKeypoints ?? 2048"
+                @update:model-value="v => generatorStore.updateConfig({ learnedFeaturesMaxKeypoints: v })"
+                :min="1024"
+                :max="8192"
+                :step="256"
+                hide-details
+                density="compact"
+                thumb-label
+                class="setting-slider"
+                :disabled="generatorStore.isGenerating"
+              />
+            </div>
+          </div>
+
           <!-- Cleanup Settings -->
           <div class="subsection-header mt-3">Post-Processing</div>
           
@@ -398,7 +572,7 @@ function downloadSplat() {
             <span class="setting-label">Cleanup</span>
             <v-switch
               :model-value="generatorStore.config.cleanupEnabled !== false"
-              @update:model-value="v => generatorStore.updateConfig({ cleanupEnabled: v })"
+              @update:model-value="v => generatorStore.updateConfig({ cleanupEnabled: v ?? undefined })"
               hide-details
               density="compact"
               color="primary"
@@ -570,7 +744,7 @@ function downloadSplat() {
               color="primary"
               block
               :disabled="!generatorStore.canGenerate"
-              @click="generatorStore.startGeneration"
+              @click="handleGenerateClick"
             >
               Generate Splats
             </v-btn>
@@ -637,6 +811,36 @@ function downloadSplat() {
         <p class="mt-2 text-grey">Checking WebGPU support...</p>
       </div>
     </div>
+    
+    <!-- Clear Scene Confirmation Dialog -->
+    <v-dialog v-model="showClearSceneDialog" max-width="400">
+      <v-card class="dialog-card">
+        <v-card-title class="dialog-title">
+          <v-icon class="mr-2" color="warning">mdi-alert-outline</v-icon>
+          Clear Scene?
+        </v-card-title>
+        <v-card-text class="dialog-text">
+          There are existing splats in the scene. Starting generation will clear the scene and any unsaved changes will be lost.
+        </v-card-text>
+        <v-card-actions class="dialog-actions">
+          <v-btn
+            variant="text"
+            color="primary"
+            @click="showClearSceneDialog = false"
+          >
+            Cancel
+          </v-btn>
+          <v-spacer />
+          <v-btn
+            variant="flat"
+            color="error"
+            @click="clearAndGenerate"
+          >
+            Clear & Generate
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>
 
@@ -700,6 +904,48 @@ function downloadSplat() {
 .image-count {
   margin-left: auto;
   color: #6B8AFF;
+  
+  &.at-limit {
+    color: #FFB347;
+  }
+}
+
+.image-section {
+  max-height: 50%;
+}
+
+.image-scroller {
+  border: 2px solid #3A3A4A;
+  border-radius: 8px;
+  background: #151520;
+  margin-bottom: 12px;
+  transition: border-color 0.2s ease, background 0.2s ease;
+  
+  &.drop-zone--active {
+    border-color: #6B8AFF;
+    background: rgba(#6B8AFF, 0.1);
+  }
+}
+
+.image-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #2A2A3A;
+  
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.image-name {
+  flex: 1;
+  font-size: 0.75rem;
+  color: #9898A8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .drop-zone {
@@ -727,16 +973,11 @@ function downloadSplat() {
   }
 }
 
-.image-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
 .image-thumb {
   position: relative;
-  aspect-ratio: 1;
+  width: 56px;
+  height: 56px;
+  min-width: 56px;
   border-radius: 6px;
   overflow: hidden;
   background: #252532;
@@ -913,6 +1154,16 @@ function downloadSplat() {
   }
 }
 
+.scene-type-select {
+  :deep(.v-field) {
+    font-size: 0.85rem;
+  }
+  
+  :deep(.v-select__selection-text) {
+    font-size: 0.85rem;
+  }
+}
+
 .mode-hint {
   font-size: 0.7rem;
   color: #5A5A6A;
@@ -930,4 +1181,24 @@ function downloadSplat() {
   }
 }
 
+.dialog-card {
+  background: #1A1A24 !important;
+}
+
+.dialog-title {
+  display: flex;
+  align-items: center;
+  padding: 16px 20px !important;
+  font-size: 1rem !important;
+}
+
+.dialog-text {
+  color: #9898A8 !important;
+  padding: 0 20px 16px !important;
+}
+
+.dialog-actions {
+  padding: 12px 16px !important;
+  border-top: 1px solid #3A3A4A;
+}
 </style>

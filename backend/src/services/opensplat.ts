@@ -17,6 +17,69 @@ function getOpenSplatPath(): string {
 }
 
 /**
+ * Quality presets for OpenSplat training
+ * These control the trade-off between quality, speed, and splat count
+ */
+interface QualityPreset {
+  // Densification control
+  densifyGradThresh: number      // Lower = more splats (default 0.0002)
+  densifyUntilIter: number       // Stop densifying after this iteration
+  refineEvery: number            // Densify interval (default 100)
+  resetAlphaEvery: number        // Reset opacity interval (default 30 refinements)
+  // Quality
+  ssimWeight: number             // SSIM loss weight (0-1, default 0.2)
+  shDegree: number               // Spherical harmonics degree (1-3)
+  // Resolution
+  numDownscales: number          // Initial downscale factor (default 2)
+  resolutionSchedule: number     // Double resolution every N steps (default 3000)
+  downscaleFactor: number        // Scale input images by this factor (1=full, 2=half, etc)
+}
+
+const QualityPresets: Record<string, QualityPreset> = {
+  // All presets use OpenSplat defaults - full resolution for best quality
+  fast: {
+    densifyGradThresh: 0.0002,
+    densifyUntilIter: 15000,
+    refineEvery: 100,
+    resetAlphaEvery: 30,
+    ssimWeight: 0.2,
+    shDegree: 3,
+    numDownscales: 2,
+    resolutionSchedule: 3000,
+    downscaleFactor: 1
+  },
+  medium: {
+    densifyGradThresh: 0.0002,
+    densifyUntilIter: 15000,
+    refineEvery: 100,
+    resetAlphaEvery: 30,
+    ssimWeight: 0.2,
+    shDegree: 3,
+    numDownscales: 2,
+    resolutionSchedule: 3000,
+    downscaleFactor: 1
+  },
+  high: {
+    densifyGradThresh: 0.0002,
+    densifyUntilIter: 15000,
+    refineEvery: 100,
+    resetAlphaEvery: 30,
+    ssimWeight: 0.2,
+    shDegree: 3,
+    numDownscales: 2,
+    resolutionSchedule: 3000,
+    downscaleFactor: 1
+  }
+}
+
+function getQualityPreset(iterations: number): QualityPreset {
+  // Select preset based on iteration count
+  if (iterations <= 10000) return QualityPresets.fast
+  if (iterations <= 20000) return QualityPresets.medium
+  return QualityPresets.high
+}
+
+/**
  * Find the latest intermediate PLY file in a directory
  * OpenSplat saves intermediate files as result_<iteration>.ply
  */
@@ -144,14 +207,39 @@ export async function trainWithOpenSplat(
   const iterations = config.iterations || 30000  // OpenSplat default
   // Save intermediate results every 10% of iterations for live preview (~10 checkpoints)
   const saveEvery = Math.max(100, Math.floor(iterations * 0.1))
+  
+  // Get quality preset based on iteration count
+  const quality = getQualityPreset(iterations)
+  const shDegree = config.shDegree || quality.shDegree
+  
+  // Calculate when to stop densifying (80% of iterations by default, but respect preset)
+  const densifyUntil = Math.min(quality.densifyUntilIter, Math.floor(iterations * 0.8))
+  
   const args = [
     colmapProjectDir,
     '-n', iterations.toString(),
     '-o', outputPly,
-    '--save-every', saveEvery.toString(), // Save intermediate results for live preview
-    '--sh-degree', '3',   // Higher SH degree for better quality
+    '--save-every', saveEvery.toString(),
+    // Quality settings
+    '--sh-degree', shDegree.toString(),
+    '--ssim-weight', quality.ssimWeight.toString(),
+    // Densification control - prevents splat explosion
+    '--densify-grad-thresh', quality.densifyGradThresh.toString(),
+    '--refine-every', quality.refineEvery.toString(),
+    '--reset-alpha-every', quality.resetAlphaEvery.toString(),
+    // Resolution scheduling (OpenSplat defaults)
+    '--num-downscales', quality.numDownscales.toString(),
+    '--resolution-schedule', quality.resolutionSchedule.toString(),
+    // Stop splitting large splats after 80% of densification period
+    '--stop-screen-size-at', Math.floor(densifyUntil * 0.8).toString(),
   ]
   
+  // Add downscale factor if not 1 (reduces input image size for faster training)
+  if (quality.downscaleFactor > 1) {
+    args.push('--downscale-factor', quality.downscaleFactor.toString())
+  }
+  
+  console.log(`[OpenSplat] Quality preset: densifyGradThresh=${quality.densifyGradThresh}, downscale=${quality.downscaleFactor}`)
   console.log(`[OpenSplat] Will save intermediate results every ${saveEvery} iterations (${Math.round(saveEvery / iterations * 100)}%)`)
 
   // Add image path if different from default
@@ -423,25 +511,76 @@ async function convertPlyToSplat(plyPath: string, splatPath: string): Promise<vo
   await fs.copyFile(plyPath, splatPath)
 }
 
+export interface OpenSplatGPUInfo {
+  nvidiaGpuDetected: boolean
+  gpuName: string | null
+  cudaVersion: string | null
+  warning: string | null
+}
+
 /**
  * Check if GPU is available for OpenSplat
- * OpenSplat auto-detects GPU, but we can check CUDA availability
+ * Note: OpenSplat binaries must be compiled WITH CUDA support to use GPU.
+ * Pre-built Windows binaries are often CPU-only.
  */
 export async function checkOpenSplatGPU(): Promise<boolean> {
-  // OpenSplat handles GPU detection internally
-  // We just check if nvidia-smi is available as a proxy
-  return new Promise((resolve) => {
-    const proc = spawn('nvidia-smi', [], {
-      shell: true,
-      timeout: 5000
-    })
+  const info = await getOpenSplatGPUInfo()
+  return info.nvidiaGpuDetected
+}
 
-    proc.on('close', (code) => {
-      resolve(code === 0)
-    })
+/**
+ * Get detailed GPU info for OpenSplat
+ * This checks system GPU availability, but note that the OpenSplat binary
+ * must also be compiled with CUDA support to actually use the GPU.
+ */
+export async function getOpenSplatGPUInfo(): Promise<OpenSplatGPUInfo> {
+  const info: OpenSplatGPUInfo = {
+    nvidiaGpuDetected: false,
+    gpuName: null,
+    cudaVersion: null,
+    warning: null
+  }
 
-    proc.on('error', () => {
-      resolve(false)
-    })
-  })
+  try {
+    // Check nvidia-smi for GPU info
+    const { exec } = await import('child_process')
+    const { promisify } = await import('util')
+    const execAsync = promisify(exec)
+
+    const { stdout } = await execAsync(
+      'nvidia-smi --query-gpu=name,driver_version --format=csv,noheader,nounits',
+      { timeout: 10000 }
+    )
+
+    const lines = stdout.trim().split('\n')
+    if (lines.length > 0 && lines[0]) {
+      const parts = lines[0].split(',').map(s => s.trim())
+      if (parts.length >= 1) {
+        info.gpuName = parts[0]
+        info.nvidiaGpuDetected = true
+      }
+    }
+
+    // Get CUDA version
+    const { stdout: smiOutput } = await execAsync('nvidia-smi', { timeout: 5000 })
+    const cudaMatch = smiOutput.match(/CUDA Version:\s*(\d+\.?\d*)/i)
+    if (cudaMatch) {
+      info.cudaVersion = cudaMatch[1]
+    }
+
+    // Warn about newer GPUs that may not be supported by pre-built binaries
+    if (info.gpuName) {
+      const gpuLower = info.gpuName.toLowerCase()
+      // RTX 40xx, 50xx series and newer may need specially compiled binaries
+      if (gpuLower.includes('rtx 40') || gpuLower.includes('rtx 50') || gpuLower.includes('ada') || gpuLower.includes('blackwell')) {
+        info.warning = `Your GPU (${info.gpuName}) may require a CUDA-enabled OpenSplat build. ` +
+          `Pre-built Windows binaries are often CPU-only. If training is slow, consider building ` +
+          `OpenSplat from source with CUDA ${info.cudaVersion || '12.x'} support.`
+      }
+    }
+  } catch {
+    info.warning = 'No NVIDIA GPU detected. OpenSplat will run in CPU mode (slower).'
+  }
+
+  return info
 }

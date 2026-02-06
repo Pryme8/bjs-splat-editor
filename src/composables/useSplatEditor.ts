@@ -3,7 +3,7 @@
  */
 
 import { computed, ref } from 'vue'
-import { useEditorStore, type GizmoType, type TransformSpace } from '@/stores/editorStore'
+import { useEditorStore, type GizmoType, type TransformSpace, type BrushMode } from '@/stores/editorStore'
 import { useAppStore } from '@/stores/appStore'
 import { useBabylon } from '@/composables/useBabylon'
 import { Vector3 } from '@babylonjs/core/Maths/math.vector'
@@ -17,8 +17,15 @@ export function useSplatEditor() {
   const isClipping = ref(false)
   const lastClipResult = ref<{ originalCount: number; clippedCount: number } | null>(null)
 
+  // Selection state
+  const isDeleting = ref(false)
+  const lastDeleteResult = ref<{ originalCount: number; remainingCount: number } | null>(null)
+
   // Computed state
   const hasScene = computed(() => appStore.hasScene)
+  const selection = computed(() => editorStore.selection)
+  const selectionCount = computed(() => editorStore.selectionCount)
+  const hasSelection = computed(() => editorStore.hasSelection)
   const showAxes = computed(() => editorStore.showAxes)
   const showGroundPlane = computed(() => editorStore.showGroundPlane)
   const groundPlaneSize = computed(() => editorStore.groundPlaneSize)
@@ -275,6 +282,66 @@ export function useSplatEditor() {
     }
   }
 
+  // Selection controls
+  function toggleSelectionBrush() {
+    editorStore.toggleSelectionBrush()
+  }
+
+  function setSelectionBrushEnabled(enabled: boolean) {
+    editorStore.setSelectionBrushEnabled(enabled)
+  }
+
+  function setSelectionBrushRadius(radius: number) {
+    editorStore.setSelectionBrushRadius(radius)
+  }
+
+  function setSelectionBrushMode(mode: BrushMode) {
+    editorStore.setSelectionBrushMode(mode)
+  }
+
+  function clearSelection() {
+    editorStore.clearSelection()
+    babylon.clearSelectionPointCloud()
+  }
+
+  function selectAll() {
+    const positions = babylon.getSplatPositions()
+    if (positions) {
+      editorStore.selectAll(positions.count)
+    }
+  }
+
+  function invertSelection() {
+    const positions = babylon.getSplatPositions()
+    if (positions) {
+      editorStore.invertSelection(positions.count)
+    }
+  }
+
+  // Note: Painting is now handled automatically by Babylon's pointer observable
+  // when the selection brush is enabled. The isPainting state is managed internally.
+
+  /**
+   * Delete selected splats
+   */
+  async function deleteSelected(): Promise<boolean> {
+    if (isDeleting.value || !editorStore.hasSelection) return false
+    
+    isDeleting.value = true
+    try {
+      const result = await babylon.deleteSelectedSplats()
+      if (result) {
+        lastDeleteResult.value = result
+        console.log('[Editor] Deleted splats:', result.originalCount - result.remainingCount, 
+          '- remaining:', result.remainingCount)
+        return true
+      }
+    } finally {
+      isDeleting.value = false
+    }
+    return false
+  }
+
   // Undo/Redo operations
   function undo(): boolean {
     const transform = editorStore.undo()
@@ -365,6 +432,21 @@ export function useSplatEditor() {
     // Bake transform
     bakeTransform,
     centerSplatAtOrigin,
+
+    // Selection (painting is handled automatically by Babylon's pointer observable)
+    selection,
+    selectionCount,
+    hasSelection,
+    isDeleting,
+    lastDeleteResult,
+    toggleSelectionBrush,
+    setSelectionBrushEnabled,
+    setSelectionBrushRadius,
+    setSelectionBrushMode,
+    clearSelection,
+    selectAll,
+    invertSelection,
+    deleteSelected,
 
     // Undo/Redo
     undo,

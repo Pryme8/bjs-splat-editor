@@ -1,0 +1,17 @@
+# AI Enhancement dependencies for bjs-splat-editor
+
+# PyTorch (use nightly for best compatibility)
+torch>=2.0.0
+# torchvision>=0.15.0  # Install matching version for your torch
+
+# Depth Anything V2
+transformers>=4.35.0
+
+# SuperPoint + LightGlue
+kornia>=0.7.0
+opencv-python>=4.8.0
+
+# Common
+Pillow>=9.0.0
+numpy>=1.24.0
+tqdm>=4.65.0

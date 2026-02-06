@@ -64,6 +64,30 @@ export interface ReadyMessage extends WorkerMessage {
 }
 
 /**
+ * Scene type for COLMAP optimization
+ */
+export type SceneType = 'auto' | 'building360' | 'interior' | 'landscape'
+
+export const SceneTypeLabels: Record<SceneType, string> = {
+  auto: 'Auto Detect',
+  building360: '360° Building/Object',
+  interior: 'Interior/Room',
+  landscape: 'Landscape/Outdoor'
+}
+
+export const SceneTypeDescriptions: Record<SceneType, string> = {
+  auto: 'Automatically detect best settings',
+  building360: 'Optimized for walking around buildings, statues, vehicles',
+  interior: 'Optimized for indoor room scans with wide angles',
+  landscape: 'Optimized for outdoor scenes with distant features'
+}
+
+/**
+ * Depth model size options
+ */
+export type DepthModelSize = 'small' | 'base' | 'large'
+
+/**
  * Generation configuration
  */
 export interface GenerationConfig {
@@ -75,11 +99,21 @@ export interface GenerationConfig {
   densifyThreshold: number
   pruneThreshold: number
   shDegree: number
+  // Scene type for COLMAP optimization
+  sceneType?: SceneType
   // Cleanup options
   cleanupEnabled?: boolean
   cleanupMinOpacity?: number
   cleanupMaxScalePercentile?: number
   cleanupSorStdDevs?: number
+  // AI Enhancement: Depth Anything V2
+  depthEstimationEnabled?: boolean
+  depthModelSize?: DepthModelSize
+  depthFloaterFilterEnabled?: boolean
+  depthFloaterThreshold?: number
+  // AI Enhancement: Learned Feature Matching (SuperPoint + LightGlue)
+  learnedFeaturesEnabled?: boolean
+  learnedFeaturesMaxKeypoints?: number
 }
 
 export const DefaultConfig: GenerationConfig = {
@@ -91,11 +125,21 @@ export const DefaultConfig: GenerationConfig = {
   densifyThreshold: 0.0002,
   pruneThreshold: 0.01,
   shDegree: 0,
+  // Scene type
+  sceneType: 'auto',
   // Cleanup defaults
   cleanupEnabled: true,
   cleanupMinOpacity: 0.05,
   cleanupMaxScalePercentile: 99,
-  cleanupSorStdDevs: 3.0
+  cleanupSorStdDevs: 3.0,
+  // AI Enhancement defaults (disabled by default, requires Python setup)
+  depthEstimationEnabled: false,
+  depthModelSize: 'small',
+  depthFloaterFilterEnabled: true,
+  depthFloaterThreshold: 0.15,
+  // Learned features defaults
+  learnedFeaturesEnabled: false,
+  learnedFeaturesMaxKeypoints: 2048
 }
 
 /**

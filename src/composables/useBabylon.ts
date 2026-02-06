@@ -14,8 +14,12 @@ import {
   Texture,
   Mesh,
   VertexData,
-  KeyboardEventTypes
+  KeyboardEventTypes,
+  PointerEventTypes,
+  Matrix
 } from '@babylonjs/core'
+import type { Observer } from '@babylonjs/core/Misc/observable'
+import type { PointerInfo } from '@babylonjs/core/Events/pointerEvents'
 import { LinesMesh } from '@babylonjs/core/Meshes/linesMesh'
 import { GaussianSplattingMesh } from '@babylonjs/core/Meshes/GaussianSplatting/gaussianSplattingMesh'
 import { AxesViewer } from '@babylonjs/core/Debug/axesViewer'
@@ -33,8 +37,14 @@ let scene: Scene | null = null
 let flyCamera: UniversalCamera | null = null
 let orbitCamera: ArcRotateCamera | null = null
 let activeCamera: UniversalCamera | ArcRotateCamera | null = null
-let currentSplat: GaussianSplattingMesh | null = null
 let debugMesh: any = null
+
+// Multi-splat storage - keyed by object ID
+const splats = new Map<string, GaussianSplattingMesh>()
+const originalBlobs = new Map<string, Blob>()
+const originalFileNames = new Map<string, string>()
+const positionCaches = new Map<string, Float32Array>()
+const splatCounts = new Map<string, number>()
 
 // COLMAP preview meshes
 let colmapPreviewMeshes: Mesh[] = []
@@ -59,8 +69,20 @@ let clipSphereGizmo: PositionGizmo | null = null
 let clipBoxMesh: LinesMesh | null = null
 let clipBoxGizmo: PositionGizmo | null = null
 
-let originalFileBlob: Blob | null = null
-let originalFileName: string | null = null
+// Selection brush and point cloud
+let selectionBrushMesh: Mesh | null = null
+let selectionPointCloud: Mesh | null = null
+let selectionPointerObserver: Observer<PointerInfo> | null = null
+let isSelectionPainting = false
+
+// Double-right-click detection for clearing selection
+let lastRightClickTime: number = 0
+let globalPointerObserver: Observer<PointerInfo> | null = null
+
+// Selection transform proxy - invisible mesh for gizmo attachment when selection exists
+let selectionProxyMesh: Mesh | null = null
+let selectionInitialCenter: Vector3 | null = null
+let selectionInitialTransform: { position: Vector3; rotation: Quaternion; scale: Vector3 } | null = null
 
 // Custom camera control state - velocity-based for smooth impulse movement
 const cameraVelocity = {
@@ -87,6 +109,43 @@ export function useBabylon() {
   const appStore = useAppStore()
   const sceneStore = useSceneStore()
   const editorStore = useEditorStore()
+
+  // Helper functions to access active splat data
+  function getActiveSplat(): GaussianSplattingMesh | null {
+    const id = editorStore.activeObjectId
+    if (!id) return null
+    return splats.get(id) || null
+  }
+
+  function getActiveBlob(): Blob | null {
+    const id = editorStore.activeObjectId
+    if (!id) return null
+    return originalBlobs.get(id) || null
+  }
+
+  function getActiveFileName(): string | null {
+    const id = editorStore.activeObjectId
+    if (!id) return null
+    return originalFileNames.get(id) || null
+  }
+
+  function getActivePositions(): Float32Array | null {
+    const id = editorStore.activeObjectId
+    if (!id) return null
+    return positionCaches.get(id) || null
+  }
+
+  function getActiveSplatCount(): number {
+    const id = editorStore.activeObjectId
+    if (!id) return 0
+    return splatCounts.get(id) || 0
+  }
+
+  // Store data for a specific splat by ID
+  function storeSplatData(id: string, blob: Blob, fileName: string) {
+    originalBlobs.set(id, blob)
+    originalFileNames.set(id, fileName)
+  }
 
   function initScene(canvas: HTMLCanvasElement) {
     // Create engine with performance options
@@ -391,6 +450,77 @@ export function useBabylon() {
     watch(() => editorStore.clipBox.center, (center) => {
       updateClipBoxPosition(center.x, center.y, center.z)
     }, { deep: true })
+
+    // Selection watchers
+    watch(() => editorStore.selection.brushEnabled, (enabled) => {
+      setSelectionBrushVisible(enabled)
+      if (enabled) {
+        setupSelectionPointerObservable()
+      } else {
+        removeSelectionPointerObservable()
+        isSelectionPainting = false
+      }
+    })
+
+    watch(() => editorStore.selection.brushRadius, (radius) => {
+      updateSelectionBrushRadius(radius)
+    })
+
+    watch(() => editorStore.selection.indices.size, (newSize, oldSize) => {
+      updateSelectionPointCloud()
+      
+      // Refresh gizmo attachment when selection state changes (has selection ↔ no selection)
+      const wasSelected = (oldSize || 0) > 0
+      const isSelected = newSize > 0
+      
+      if (wasSelected !== isSelected && editorStore.activeGizmo !== 'none') {
+        // Selection state changed - re-attach gizmo to correct target
+        setActiveGizmo(editorStore.activeGizmo)
+      }
+    })
+
+    // Setup global pointer observer for double-right-click to clear selection
+    setupGlobalPointerObservable()
+  }
+
+  /**
+   * Setup global pointer observable for features that work regardless of brush state
+   * Currently handles: double-right-click to clear selection
+   */
+  function setupGlobalPointerObservable() {
+    if (!scene) return
+
+    // Remove existing observer if any
+    if (globalPointerObserver) {
+      scene.onPointerObservable.remove(globalPointerObserver)
+      globalPointerObserver = null
+    }
+
+    globalPointerObserver = scene.onPointerObservable.add((pointerInfo) => {
+      if (pointerInfo.type !== PointerEventTypes.POINTERDOWN) return
+
+      const evt = pointerInfo.event as PointerEvent
+      
+      // Check for right mouse button (button === 2)
+      if (evt.button === 2) {
+        const now = Date.now()
+        const timeSinceLastClick = now - lastRightClickTime
+        
+        // Double-click detected (within 300ms)
+        if (timeSinceLastClick < 300 && editorStore.hasSelection) {
+          console.log('[Babylon] Double-right-click detected - clearing selection')
+          editorStore.clearSelection()
+          clearSelectionPointCloud()
+          
+          // Reset timer to prevent triple-click triggering another clear
+          lastRightClickTime = 0
+        } else {
+          lastRightClickTime = now
+        }
+      }
+    })
+
+    console.log('[Babylon] Global pointer observable setup (double-right-click to clear selection)')
   }
 
   // ============================================
@@ -450,6 +580,9 @@ export function useBabylon() {
 
     // Create ground plane
     createGroundPlane()
+
+    // Create selection brush
+    createSelectionBrush()
 
     console.log('[Babylon] Editor helpers initialized')
   }
@@ -540,6 +673,8 @@ export function useBabylon() {
   function setActiveGizmo(gizmoType: GizmoType) {
     if (!utilityLayer || !scene) return
 
+    const currentSplat = getActiveSplat()
+
     // Dispose all existing gizmos
     if (rotationGizmo) {
       rotationGizmo.dispose()
@@ -555,67 +690,112 @@ export function useBabylon() {
     }
 
     if (gizmoType === 'none' || !currentSplat) {
+      disposeSelectionProxy()
       console.log('[Babylon] Gizmos cleared')
       return
     }
 
+    // Check if we have a selection - if so, gizmo attaches to proxy mesh
+    const hasSelection = editorStore.hasSelection
+
     // Determine if we should use local space (true) or world space (false)
     const useLocalSpace = editorStore.transformSpace === 'local'
 
-    // Helper to capture transform before drag starts
-    const captureTransformBeforeDrag = () => {
-      transformBeforeDrag = editorStore.getTransformSnapshot()
+    // Determine which mesh to attach gizmo to
+    let targetMesh: Mesh | GaussianSplattingMesh | null = currentSplat
+
+    if (hasSelection) {
+      // Create/update proxy mesh at selection center
+      if (!createOrUpdateSelectionProxy()) {
+        console.warn('[Babylon] Failed to create selection proxy - no valid selection')
+        return
+      }
+      targetMesh = selectionProxyMesh
+      console.log('[Babylon] Gizmo will attach to selection proxy')
+    } else {
+      // No selection - clean up any existing proxy
+      disposeSelectionProxy()
     }
 
-    // Helper to sync transform and create undo command
-    const syncAndCreateCommand = () => {
-      const before = transformBeforeDrag
-      syncTransformToStore()
-      const after = editorStore.getTransformSnapshot()
-      
-      // Only create command if transform actually changed
-      if (before && (
-        before.position.x !== after.position.x ||
-        before.position.y !== after.position.y ||
-        before.position.z !== after.position.z ||
-        before.rotation.x !== after.rotation.x ||
-        before.rotation.y !== after.rotation.y ||
-        before.rotation.z !== after.rotation.z ||
-        before.scale.x !== after.scale.x ||
-        before.scale.y !== after.scale.y ||
-        before.scale.z !== after.scale.z
-      )) {
-        editorStore.pushCommand({ type: 'transform', before, after })
+    if (!targetMesh) {
+      console.warn('[Babylon] No target mesh for gizmo')
+      return
+    }
+
+    // Helper to capture transform before drag starts
+    const captureTransformBeforeDrag = () => {
+      if (hasSelection) {
+        captureSelectionProxyTransform()
+      } else {
+        transformBeforeDrag = editorStore.getTransformSnapshot()
       }
-      transformBeforeDrag = null
+    }
+
+    // Helper for handling drag updates (for selection preview)
+    const onDragUpdate = () => {
+      if (hasSelection && selectionProxyMesh && selectionInitialTransform) {
+        updateSelectionPointCloudFromProxy()
+      }
+    }
+
+    // Helper to sync transform and create undo command / apply selection transform
+    const syncAndCreateCommand = async () => {
+      if (hasSelection) {
+        // Apply transform to selected splats
+        await applySelectionProxyTransform()
+      } else {
+        // Standard mesh transform behavior
+        const before = transformBeforeDrag
+        syncTransformToStore()
+        const after = editorStore.getTransformSnapshot()
+        
+        // Only create command if transform actually changed
+        if (before && (
+          before.position.x !== after.position.x ||
+          before.position.y !== after.position.y ||
+          before.position.z !== after.position.z ||
+          before.rotation.x !== after.rotation.x ||
+          before.rotation.y !== after.rotation.y ||
+          before.rotation.z !== after.rotation.z ||
+          before.scale.x !== after.scale.x ||
+          before.scale.y !== after.scale.y ||
+          before.scale.z !== after.scale.z
+        )) {
+          editorStore.pushCommand({ type: 'transform', before, after })
+        }
+        transformBeforeDrag = null
+      }
     }
 
     // Create the appropriate gizmo
     switch (gizmoType) {
       case 'rotate':
         rotationGizmo = new RotationGizmo(utilityLayer)
-        rotationGizmo.attachedMesh = currentSplat
+        rotationGizmo.attachedMesh = targetMesh
         rotationGizmo.updateGizmoRotationToMatchAttachedMesh = useLocalSpace
         rotationGizmo.onDragStartObservable.add(captureTransformBeforeDrag)
+        rotationGizmo.onDragObservable.add(onDragUpdate)
         rotationGizmo.onDragEndObservable.add(syncAndCreateCommand)
-        console.log('[Babylon] Rotation gizmo attached, local:', useLocalSpace)
+        console.log('[Babylon] Rotation gizmo attached to', hasSelection ? 'selection proxy' : 'splat', ', local:', useLocalSpace)
         break
 
       case 'translate':
         positionGizmo = new PositionGizmo(utilityLayer)
-        positionGizmo.attachedMesh = currentSplat
+        positionGizmo.attachedMesh = targetMesh
         positionGizmo.updateGizmoRotationToMatchAttachedMesh = useLocalSpace
         positionGizmo.onDragStartObservable.add(captureTransformBeforeDrag)
+        positionGizmo.onDragObservable.add(onDragUpdate)
         positionGizmo.onDragEndObservable.add(syncAndCreateCommand)
-        console.log('[Babylon] Position gizmo attached, local:', useLocalSpace)
+        console.log('[Babylon] Position gizmo attached to', hasSelection ? 'selection proxy' : 'splat', ', local:', useLocalSpace)
         break
 
       case 'scale':
         scaleGizmo = new ScaleGizmo(utilityLayer)
-        scaleGizmo.attachedMesh = currentSplat
+        scaleGizmo.attachedMesh = targetMesh
         scaleGizmo.onDragStartObservable.add(captureTransformBeforeDrag)
+        scaleGizmo.onDragObservable.add(onDragUpdate)
         scaleGizmo.onDragEndObservable.add(syncAndCreateCommand)
-        console.log('[Babylon] Scale gizmo attached')
+        console.log('[Babylon] Scale gizmo attached to', hasSelection ? 'selection proxy' : 'splat')
         break
     }
   }
@@ -633,6 +813,7 @@ export function useBabylon() {
   }
 
   function syncTransformToStore() {
+    const currentSplat = getActiveSplat()
     if (!currentSplat) return
 
     const pos = currentSplat.position
@@ -651,6 +832,7 @@ export function useBabylon() {
   }
 
   function applySplatTransform(position?: { x: number; y: number; z: number }, rotation?: { x: number; y: number; z: number }, scale?: { x: number; y: number; z: number }) {
+    const currentSplat = getActiveSplat()
     if (!currentSplat) return
 
     if (position) {
@@ -670,6 +852,7 @@ export function useBabylon() {
   }
 
   function resetSplatTransform() {
+    const currentSplat = getActiveSplat()
     if (!currentSplat) return
 
     currentSplat.position = Vector3.Zero()
@@ -681,6 +864,7 @@ export function useBabylon() {
   }
 
   function rotateSplat90(axis: 'x' | 'y' | 'z') {
+    const currentSplat = getActiveSplat()
     if (!currentSplat) return
 
     const angle = Math.PI * 0.5  // 90 degrees
@@ -702,6 +886,7 @@ export function useBabylon() {
 
   // Apply a transform directly to the mesh (used by undo/redo)
   function applyTransformFromHistory(transform: Transform) {
+    const currentSplat = getActiveSplat()
     if (!currentSplat) return
 
     currentSplat.position = new Vector3(transform.position.x, transform.position.y, transform.position.z)
@@ -928,6 +1113,9 @@ export function useBabylon() {
   }
 
   async function applyClipBox(): Promise<{ originalCount: number; clippedCount: number } | null> {
+    const originalFileBlob = getActiveBlob()
+    const currentSplat = getActiveSplat()
+    
     if (!originalFileBlob || !scene) {
       console.error('[Babylon] No original file to clip')
       return null
@@ -1086,7 +1274,8 @@ export function useBabylon() {
     const clippedBlob = new Blob([newFile], { type: 'application/octet-stream' })
     const url = URL.createObjectURL(clippedBlob)
     
-    await loadSplat(url, originalFileName || 'clipped.ply', false, true)
+    const fileName = getActiveFileName() || 'clipped.ply'
+    await loadSplat(url, fileName, false, true)
     URL.revokeObjectURL(url)
 
     return { originalCount, clippedCount }
@@ -1135,26 +1324,34 @@ export function useBabylon() {
     const clippedBlob = new Blob([newFile], { type: 'application/octet-stream' })
     const url = URL.createObjectURL(clippedBlob)
     
-    await loadSplat(url, originalFileName || 'clipped.splat', false, true)
+    const fileName = getActiveFileName() || 'clipped.splat'
+    await loadSplat(url, fileName, false, true)
     URL.revokeObjectURL(url)
 
     return { originalCount, clippedCount }
   }
 
-  function storeOriginalFile(blob: Blob, name: string) {
-    originalFileBlob = blob
-    originalFileName = name
-    console.log('[Babylon] Original file stored:', name, blob.size, 'bytes')
+  function storeOriginalFile(id: string, blob: Blob, name: string) {
+    originalBlobs.set(id, blob)
+    originalFileNames.set(id, name)
+    console.log('[Babylon] Original file stored for', id, ':', name, blob.size, 'bytes')
   }
 
-  function getOriginalFile(): { blob: Blob; name: string } | null {
-    if (originalFileBlob && originalFileName) {
-      return { blob: originalFileBlob, name: originalFileName }
+  function getOriginalFile(id?: string): { blob: Blob; name: string } | null {
+    const targetId = id || editorStore.activeObjectId
+    if (!targetId) return null
+    const blob = originalBlobs.get(targetId)
+    const name = originalFileNames.get(targetId)
+    if (blob && name) {
+      return { blob, name }
     }
     return null
   }
 
   async function applyClipSphere(): Promise<{ originalCount: number; clippedCount: number } | null> {
+    const originalFileBlob = getActiveBlob()
+    const currentSplat = getActiveSplat()
+    
     if (!originalFileBlob || !scene) {
       console.error('[Babylon] No original file to clip')
       return null
@@ -1358,7 +1555,8 @@ export function useBabylon() {
     const clippedBlob = new Blob([newFile], { type: 'application/octet-stream' })
     const url = URL.createObjectURL(clippedBlob)
     
-    await loadSplat(url, originalFileName || 'clipped.ply', false, true)
+    const fileName = getActiveFileName() || 'clipped.ply'
+    await loadSplat(url, fileName, false, true)
     URL.revokeObjectURL(url)
 
     return { originalCount, clippedCount }
@@ -1410,7 +1608,8 @@ export function useBabylon() {
     const clippedBlob = new Blob([newFile], { type: 'application/octet-stream' })
     const url = URL.createObjectURL(clippedBlob)
     
-    await loadSplat(url, originalFileName || 'clipped.splat', false, true)
+    const fileName = getActiveFileName() || 'clipped.splat'
+    await loadSplat(url, fileName, false, true)
     URL.revokeObjectURL(url)
 
     return { originalCount, clippedCount }
@@ -1470,6 +1669,7 @@ export function useBabylon() {
    * Uses Babylon.js built-in bakeCurrentTransformIntoVertices() method.
    */
   function bakeTransformToVertices(): boolean {
+    const currentSplat = getActiveSplat()
     if (!currentSplat) {
       console.error('[Babylon] No splat loaded to bake transform')
       return false
@@ -1515,6 +1715,7 @@ export function useBabylon() {
    * and offsetting all vertices.
    */
   function centerAtOrigin(): boolean {
+    const currentSplat = getActiveSplat()
     if (!currentSplat) {
       console.error('[Babylon] No splat loaded to center')
       return false
@@ -1544,20 +1745,1284 @@ export function useBabylon() {
     }
   }
 
-  async function loadSplat(url: string, name: string, isPreview: boolean = false, isInternalReload: boolean = false) {
+  // ============================================================
+  // SELECTION BRUSH AND POINT CLOUD
+  // ============================================================
+
+  /**
+   * Create the selection brush sphere (transparent)
+   */
+  function createSelectionBrush() {
+    if (!scene) return
+
+    // Dispose existing
+    if (selectionBrushMesh) {
+      selectionBrushMesh.dispose()
+    }
+
+    const radius = editorStore.selection.brushRadius
+
+    // Create a semi-transparent sphere
+    selectionBrushMesh = MeshBuilder.CreateSphere('selectionBrush', {
+      diameter: radius * 2,
+      segments: 24
+    }, scene)
+
+    const material = new StandardMaterial('selectionBrushMat', scene)
+    material.diffuseColor = new Color3(0.2, 0.8, 1.0) // Cyan
+    material.alpha = 0.3
+    material.backFaceCulling = false
+    selectionBrushMesh.material = material
+
+    // Start hidden
+    selectionBrushMesh.setEnabled(false)
+    selectionBrushMesh.isPickable = false
+  }
+
+  /**
+   * Show/hide the selection brush
+   */
+  function setSelectionBrushVisible(visible: boolean) {
+    if (selectionBrushMesh) {
+      selectionBrushMesh.setEnabled(visible)
+    }
+  }
+
+  /**
+   * Update the selection brush radius
+   */
+  function updateSelectionBrushRadius(radius: number) {
+    if (!selectionBrushMesh || !scene) return
+
+    // Recreate the sphere with new size
+    const position = selectionBrushMesh.position.clone()
+    const wasEnabled = selectionBrushMesh.isEnabled()
+
+    selectionBrushMesh.dispose()
+
+    selectionBrushMesh = MeshBuilder.CreateSphere('selectionBrush', {
+      diameter: radius * 2,
+      segments: 24
+    }, scene)
+
+    const material = new StandardMaterial('selectionBrushMat', scene)
+    material.diffuseColor = new Color3(0.2, 0.8, 1.0)
+    material.alpha = 0.3
+    material.backFaceCulling = false
+    selectionBrushMesh.material = material
+
+    selectionBrushMesh.position = position
+    selectionBrushMesh.setEnabled(wasEnabled)
+    selectionBrushMesh.isPickable = false
+  }
+
+  /**
+   * Position the selection brush at a specific world position
+   */
+  function setSelectionBrushPosition(x: number, y: number, z: number) {
+    if (selectionBrushMesh) {
+      selectionBrushMesh.position.set(x, y, z)
+    }
+  }
+
+  /**
+   * Find the nearest splat to a picking ray and return its position
+   * Uses Babylon's scene.pick for proper coordinate handling
+   */
+  function findBrushPositionFromPointer(pointerX: number, pointerY: number): Vector3 | null {
+    const posData = getSplatPositions()
+    if (!scene || !activeCamera || !posData) {
+      return null
+    }
+    
+    const { positions: cachedSplatPositions, count: cachedSplatCount } = posData
+
+    // Use scene.createPickingRay with the pointer coordinates
+    // The scene automatically handles the coordinate transformation
+    const ray = scene.createPickingRay(pointerX, pointerY, Matrix.Identity(), activeCamera)
+
+    // Find the splat closest to the ray (smallest perpendicular distance)
+    let closestPerpDistSq = Infinity
+    let closestPosition: Vector3 | null = null
+    const maxRayDist = 500 // Maximum distance along the ray to consider
+    
+    // Tight search radius - only consider splats very close to the ray
+    // This makes the brush positioning much more accurate
+    const maxPerpDist = 0.5 // Maximum perpendicular distance from ray to consider
+
+    for (let i = 0; i < cachedSplatCount; i++) {
+      const idx = i * 3
+      const sx = cachedSplatPositions[idx]
+      const sy = cachedSplatPositions[idx + 1]
+      const sz = cachedSplatPositions[idx + 2]
+
+      // Calculate distance from splat to ray using vector math
+      // Vector from ray origin to splat
+      const toSplatX = sx - ray.origin.x
+      const toSplatY = sy - ray.origin.y
+      const toSplatZ = sz - ray.origin.z
+
+      // Project onto ray direction
+      const projLength = toSplatX * ray.direction.x + toSplatY * ray.direction.y + toSplatZ * ray.direction.z
+      
+      // Skip if behind camera or too far
+      if (projLength < 0.1 || projLength > maxRayDist) continue
+
+      // Calculate perpendicular distance to ray
+      const projX = ray.origin.x + ray.direction.x * projLength
+      const projY = ray.origin.y + ray.direction.y * projLength
+      const projZ = ray.origin.z + ray.direction.z * projLength
+      
+      const perpDistSq = (sx - projX) * (sx - projX) + (sy - projY) * (sy - projY) + (sz - projZ) * (sz - projZ)
+
+      // Find the splat with the smallest perpendicular distance to the ray
+      // This gives us the most accurate brush positioning
+      if (perpDistSq < maxPerpDist * maxPerpDist && perpDistSq < closestPerpDistSq) {
+        closestPerpDistSq = perpDistSq
+        closestPosition = new Vector3(sx, sy, sz)
+      }
+    }
+
+    return closestPosition
+  }
+
+  /**
+   * Setup pointer observable for selection brush
+   */
+  function setupSelectionPointerObservable() {
+    if (!scene) return
+
+    // Remove existing observer
+    if (selectionPointerObserver) {
+      scene.onPointerObservable.remove(selectionPointerObserver)
+      selectionPointerObserver = null
+    }
+
+    selectionPointerObserver = scene.onPointerObservable.add((pointerInfo) => {
+      // Only handle if brush is enabled
+      if (!editorStore.selection.brushEnabled) return
+
+      const evt = pointerInfo.event as PointerEvent
+
+      switch (pointerInfo.type) {
+        case PointerEventTypes.POINTERMOVE: {
+          // Update brush position
+          const position = findBrushPositionFromPointer(scene!.pointerX, scene!.pointerY)
+          if (selectionBrushMesh) {
+            if (position) {
+              // Found a splat within threshold - show brush at position
+              selectionBrushMesh.setEnabled(true)
+              selectionBrushMesh.position.copyFrom(position)
+            } else {
+              // No splat within threshold - hide brush
+              selectionBrushMesh.setEnabled(false)
+            }
+          }
+
+          // Paint if currently painting (only if we have a valid position)
+          if (isSelectionPainting && position) {
+            paintAtPosition(position)
+          }
+          break
+        }
+
+        case PointerEventTypes.POINTERDOWN: {
+          if (evt.button === 0) { // Left mouse button
+            isSelectionPainting = true
+            
+            // Disable camera controls while painting to prevent camera movement
+            const canvas = scene!.getEngine().getRenderingCanvas()
+            if (orbitCamera && canvas) {
+              orbitCamera.detachControl()
+            }
+            if (flyCamera && canvas) {
+              flyCamera.detachControl()
+            }
+            
+            // Initial paint at current position
+            const position = findBrushPositionFromPointer(scene!.pointerX, scene!.pointerY)
+            if (position) {
+              paintAtPosition(position)
+            }
+          }
+          break
+        }
+
+        case PointerEventTypes.POINTERUP: {
+          if (evt.button === 0) {
+            isSelectionPainting = false
+            
+            // Re-enable camera controls after painting
+            const canvas = scene!.getEngine().getRenderingCanvas()
+            if (canvas) {
+              const activeCamera = scene!.activeCamera
+              if (activeCamera === orbitCamera && orbitCamera) {
+                orbitCamera.attachControl(canvas, true)
+              } else if (activeCamera === flyCamera && flyCamera) {
+                flyCamera.attachControl(canvas, true)
+              }
+            }
+          }
+          break
+        }
+      }
+    })
+
+    console.log('[Babylon] Selection pointer observable setup')
+  }
+
+  /**
+   * Paint selection at a specific world position
+   */
+  function paintAtPosition(position: Vector3) {
+    const posData = getSplatPositions()
+    if (!posData) return
+
+    const { positions: cachedSplatPositions, count: cachedSplatCount } = posData
+    const brushRadius = editorStore.selection.brushRadius
+    const radiusSq = brushRadius * brushRadius
+    const indices: number[] = []
+
+    for (let i = 0; i < cachedSplatCount; i++) {
+      const idx = i * 3
+      const dx = cachedSplatPositions[idx] - position.x
+      const dy = cachedSplatPositions[idx + 1] - position.y
+      const dz = cachedSplatPositions[idx + 2] - position.z
+      const distSq = dx * dx + dy * dy + dz * dz
+
+      if (distSq <= radiusSq) {
+        indices.push(i)
+      }
+    }
+
+    if (indices.length > 0) {
+      if (editorStore.selection.brushMode === 'add') {
+        editorStore.addToSelection(indices)
+      } else {
+        editorStore.removeFromSelection(indices)
+      }
+    }
+  }
+
+  /**
+   * Remove selection pointer observable
+   */
+  function removeSelectionPointerObservable() {
+    if (scene && selectionPointerObserver) {
+      scene.onPointerObservable.remove(selectionPointerObserver)
+      selectionPointerObserver = null
+    }
+  }
+
+  /**
+   * Cache splat positions from the original file for fast lookups
+   * Called after loading a splat file
+   */
+  async function cacheSplatPositions(id: string) {
+    const blob = originalBlobs.get(id)
+    if (!blob) {
+      console.warn('[Babylon] No original file to cache positions from for', id)
+      positionCaches.delete(id)
+      splatCounts.delete(id)
+      return
+    }
+
+    try {
+      const arrayBuffer = await blob.arrayBuffer()
+      const uint8 = new Uint8Array(arrayBuffer)
+      const header = new TextDecoder().decode(uint8.slice(0, 100))
+
+      if (header.startsWith('ply')) {
+        await cachePlyPositions(id, uint8)
+      } else {
+        await cacheSplatFilePositions(id, uint8)
+      }
+
+      console.log('[Babylon] Cached', splatCounts.get(id), 'splat positions for', id)
+    } catch (e) {
+      console.error('[Babylon] Failed to cache splat positions for', id, ':', e)
+      positionCaches.delete(id)
+      splatCounts.delete(id)
+    }
+  }
+
+  async function cachePlyPositions(id: string, data: Uint8Array) {
+    const headerEnd = findPlyHeaderEnd(data)
+    if (headerEnd < 0) {
+      throw new Error('Invalid PLY file')
+    }
+
+    const headerStr = new TextDecoder().decode(data.slice(0, headerEnd))
+    const vertexCountMatch = headerStr.match(/element vertex (\d+)/)
+    if (!vertexCountMatch) {
+      throw new Error('Invalid PLY file - no vertex count')
+    }
+
+    const vertexCount = parseInt(vertexCountMatch[1])
+    const properties = parsePlyProperties(headerStr)
+    const vertexSize = properties.reduce((sum, p) => sum + p.size, 0)
+
+    const xProp = properties.find(p => p.name === 'x')
+    const yProp = properties.find(p => p.name === 'y')
+    const zProp = properties.find(p => p.name === 'z')
+
+    if (!xProp || !yProp || !zProp) {
+      throw new Error('PLY missing position properties')
+    }
+
+    const dataView = new DataView(data.buffer, data.byteOffset + headerEnd)
+    const positions = new Float32Array(vertexCount * 3)
+
+    for (let i = 0; i < vertexCount; i++) {
+      const offset = i * vertexSize
+      const x = dataView.getFloat32(offset + xProp.offset, true)
+      // Negate Y to match Babylon's coordinate transform for PLY files
+      const y = -dataView.getFloat32(offset + yProp.offset, true)
+      const z = dataView.getFloat32(offset + zProp.offset, true)
+
+      positions[i * 3] = x
+      positions[i * 3 + 1] = y
+      positions[i * 3 + 2] = z
+    }
+
+    positionCaches.set(id, positions)
+    splatCounts.set(id, vertexCount)
+  }
+
+  async function cacheSplatFilePositions(id: string, data: Uint8Array) {
+    const bytesPerSplat = 32
+    const count = Math.floor(data.length / bytesPerSplat)
+    const dataView = new DataView(data.buffer, data.byteOffset)
+
+    const positions = new Float32Array(count * 3)
+
+    for (let i = 0; i < count; i++) {
+      const offset = i * bytesPerSplat
+      const x = dataView.getFloat32(offset, true)
+      // Negate Y to match Babylon's coordinate transform
+      const y = -dataView.getFloat32(offset + 4, true)
+      const z = dataView.getFloat32(offset + 8, true)
+
+      positions[i * 3] = x
+      positions[i * 3 + 1] = y
+      positions[i * 3 + 2] = z
+    }
+
+    positionCaches.set(id, positions)
+    splatCounts.set(id, count)
+  }
+
+  /**
+   * Get the cached splat positions array for active object
+   */
+  function getSplatPositions(id?: string): { positions: Float32Array; count: number } | null {
+    const targetId = id || editorStore.activeObjectId
+    if (!targetId) return null
+    const positions = positionCaches.get(targetId)
+    const count = splatCounts.get(targetId)
+    if (!positions || !count) {
+      return null
+    }
+    return { positions, count }
+  }
+
+  /**
+   * Create or update the selection point cloud to show selected splats
+   */
+  function updateSelectionPointCloud() {
+    const posData = getSplatPositions()
+    if (!scene || !posData) return
+
+    const { positions: cachedSplatPositions, count: cachedSplatCount } = posData
+    const selectedIndices = editorStore.selection.indices
+
+    // Dispose existing
+    if (selectionPointCloud) {
+      selectionPointCloud.dispose()
+      selectionPointCloud = null
+    }
+
+    if (selectedIndices.size === 0) {
+      return
+    }
+
+    // Build positions array from selected indices
+    const positions: number[] = []
+    const colors: number[] = []
+    
+    for (const idx of selectedIndices) {
+      if (idx >= 0 && idx < cachedSplatCount) {
+        positions.push(
+          cachedSplatPositions[idx * 3],
+          cachedSplatPositions[idx * 3 + 1],
+          cachedSplatPositions[idx * 3 + 2]
+        )
+        // Cyan highlight color with full opacity
+        colors.push(0, 1, 1, 1)
+      }
+    }
+
+    if (positions.length === 0) return
+
+    // Create custom mesh for point cloud
+    selectionPointCloud = new Mesh('selectionPointCloud', scene)
+    
+    // Parent to splat mesh so positions match the splat's coordinate space
+    const currentSplat = getActiveSplat()
+    if (currentSplat) {
+      selectionPointCloud.parent = currentSplat
+    }
+    
+    const vertexData = new VertexData()
+    vertexData.positions = positions
+    vertexData.colors = colors
+    
+    // Create indices for points (each point is its own index)
+    const indices: number[] = []
+    for (let i = 0; i < positions.length / 3; i++) {
+      indices.push(i)
+    }
+    vertexData.indices = indices
+    
+    vertexData.applyToMesh(selectionPointCloud)
+
+    // Create point material
+    const material = new StandardMaterial('selectionPointMat', scene)
+    material.emissiveColor = new Color3(0, 1, 1) // Cyan glow
+    material.disableLighting = true
+    material.pointsCloud = true
+    material.pointSize = 8
+    
+    selectionPointCloud.material = material
+    selectionPointCloud.isPickable = false
+
+    console.log('[Babylon] Updated selection point cloud with', selectedIndices.size, 'points')
+  }
+
+  /**
+   * Clear the selection point cloud
+   */
+  function clearSelectionPointCloud() {
+    if (selectionPointCloud) {
+      selectionPointCloud.parent = null  // Unparent before disposing
+      selectionPointCloud.dispose()
+      selectionPointCloud = null
+    }
+  }
+
+  /**
+   * Calculate the center of the current selection (bounding box center)
+   */
+  function getSelectionCenter(): Vector3 | null {
+    const posData = getSplatPositions()
+    if (!posData) {
+      return null
+    }
+
+    const { positions: cachedSplatPositions, count: cachedSplatCount } = posData
+    const selectedIndices = editorStore.selection.indices
+    if (selectedIndices.size === 0) {
+      return null
+    }
+
+    let minX = Infinity, minY = Infinity, minZ = Infinity
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
+
+    for (const idx of selectedIndices) {
+      if (idx >= 0 && idx < cachedSplatCount) {
+        const x = cachedSplatPositions[idx * 3]
+        const y = cachedSplatPositions[idx * 3 + 1]
+        const z = cachedSplatPositions[idx * 3 + 2]
+
+        minX = Math.min(minX, x)
+        minY = Math.min(minY, y)
+        minZ = Math.min(minZ, z)
+        maxX = Math.max(maxX, x)
+        maxY = Math.max(maxY, y)
+        maxZ = Math.max(maxZ, z)
+      }
+    }
+
+    if (minX === Infinity) {
+      return null
+    }
+
+    return new Vector3(
+      (minX + maxX) * 0.5,
+      (minY + maxY) * 0.5,
+      (minZ + maxZ) * 0.5
+    )
+  }
+
+  /**
+   * Create or update the selection proxy mesh (invisible mesh used for gizmo attachment)
+   */
+  function createOrUpdateSelectionProxy(): boolean {
+    if (!scene) return false
+
+    const center = getSelectionCenter()
+    if (!center) {
+      disposeSelectionProxy()
+      return false
+    }
+
+    // Create proxy mesh if it doesn't exist
+    if (!selectionProxyMesh) {
+      selectionProxyMesh = MeshBuilder.CreateBox('selectionProxy', { size: 0.01 }, scene)
+      selectionProxyMesh.isVisible = false
+      selectionProxyMesh.isPickable = false
+    }
+
+    // Make proxy a child of the splat mesh so gizmo operates in splat's local space
+    // This ensures the rotation we get from the gizmo matches the PLY coordinate system
+    const currentSplat = getActiveSplat()
+    if (currentSplat && selectionProxyMesh.parent !== currentSplat) {
+      selectionProxyMesh.parent = currentSplat
+    }
+
+    // Position proxy at selection center (in local space, since it's now a child of splat)
+    selectionProxyMesh.position.copyFrom(center)
+    selectionProxyMesh.rotationQuaternion = Quaternion.Identity()
+    selectionProxyMesh.scaling.setAll(1)
+
+    // Store initial center for transform calculations
+    selectionInitialCenter = center.clone()
+
+    console.log('[Babylon] Selection proxy created at:', center.x.toFixed(2), center.y.toFixed(2), center.z.toFixed(2))
+    return true
+  }
+
+  /**
+   * Dispose selection proxy mesh
+   */
+  function disposeSelectionProxy() {
+    if (selectionProxyMesh) {
+      selectionProxyMesh.parent = null  // Unparent before disposing
+      selectionProxyMesh.dispose()
+      selectionProxyMesh = null
+    }
+    selectionInitialCenter = null
+    selectionInitialTransform = null
+  }
+
+  /**
+   * Capture the initial transform state of the selection proxy (called on drag start)
+   */
+  function captureSelectionProxyTransform() {
+    if (!selectionProxyMesh) return
+    
+    selectionInitialTransform = {
+      position: selectionProxyMesh.position.clone(),
+      rotation: selectionProxyMesh.rotationQuaternion?.clone() || Quaternion.Identity(),
+      scale: selectionProxyMesh.scaling.clone()
+    }
+    
+    console.log('[Babylon] Captured selection proxy initial transform')
+  }
+
+  /**
+   * Update the selection point cloud preview during gizmo drag
+   * Transforms the cached positions by the delta between initial and current proxy transform
+   */
+  function updateSelectionPointCloudFromProxy() {
+    const posData = getSplatPositions()
+    if (!scene || !posData || !selectionProxyMesh || !selectionInitialTransform || !selectionInitialCenter) {
+      return
+    }
+
+    const { positions: cachedSplatPositions, count: cachedSplatCount } = posData
+    const selectedIndices = editorStore.selection.indices
+    if (selectedIndices.size === 0) return
+
+    // Calculate delta transform from initial to current
+    const currentPos = selectionProxyMesh.position
+    const currentRot = selectionProxyMesh.rotationQuaternion || Quaternion.Identity()
+    const currentScale = selectionProxyMesh.scaling
+
+    const initialPos = selectionInitialTransform.position
+    const initialRot = selectionInitialTransform.rotation
+    const initialScale = selectionInitialTransform.scale
+
+    // Dispose existing point cloud
+    if (selectionPointCloud) {
+      selectionPointCloud.dispose()
+      selectionPointCloud = null
+    }
+
+    // Build transformed positions array
+    const positions: number[] = []
+    const colors: number[] = []
+
+    // Pre-calculate inverse initial rotation for delta calculation
+    const initialRotInverse = initialRot.clone()
+    initialRotInverse.invertInPlace()
+    
+    // Delta rotation = inverse(initial) * current
+    // This gives us the rotation to apply to points to move them from initial orientation to current
+    const deltaRot = initialRotInverse.multiply(currentRot)
+    
+    // Delta scale = current / initial
+    const deltaScale = new Vector3(
+      currentScale.x / (initialScale.x || 1),
+      currentScale.y / (initialScale.y || 1),
+      currentScale.z / (initialScale.z || 1)
+    )
+    
+    // Delta translation = current - initial
+    const deltaTranslation = currentPos.subtract(initialPos)
+
+    const pivot = selectionInitialCenter
+    const tempPos = new Vector3()
+    const rotatedPos = new Vector3()
+
+    for (const idx of selectedIndices) {
+      if (idx >= 0 && idx < cachedSplatCount) {
+        // Get original position
+        const x = cachedSplatPositions[idx * 3]
+        const y = cachedSplatPositions[idx * 3 + 1]
+        const z = cachedSplatPositions[idx * 3 + 2]
+
+        // Transform around pivot:
+        // 1. Translate to origin (relative to pivot)
+        tempPos.set(x - pivot.x, y - pivot.y, z - pivot.z)
+        
+        // 2. Apply scale
+        tempPos.x *= deltaScale.x
+        tempPos.y *= deltaScale.y
+        tempPos.z *= deltaScale.z
+        
+        // 3. Apply rotation
+        tempPos.rotateByQuaternionToRef(deltaRot, rotatedPos)
+        
+        // 4. Translate back and add delta translation
+        const newX = rotatedPos.x + pivot.x + deltaTranslation.x
+        const newY = rotatedPos.y + pivot.y + deltaTranslation.y
+        const newZ = rotatedPos.z + pivot.z + deltaTranslation.z
+
+        positions.push(newX, newY, newZ)
+        // Cyan highlight color
+        colors.push(0, 1, 1, 1)
+      }
+    }
+
+    if (positions.length === 0) return
+
+    // Create custom mesh for point cloud
+    selectionPointCloud = new Mesh('selectionPointCloud', scene)
+    
+    // Parent to splat mesh so positions match the splat's coordinate space
+    const currentSplat = getActiveSplat()
+    if (currentSplat) {
+      selectionPointCloud.parent = currentSplat
+    }
+    
+    const vertexData = new VertexData()
+    vertexData.positions = positions
+    vertexData.colors = colors
+    
+    // Create indices for points
+    const indices: number[] = []
+    for (let i = 0; i < positions.length / 3; i++) {
+      indices.push(i)
+    }
+    vertexData.indices = indices
+    
+    vertexData.applyToMesh(selectionPointCloud)
+
+    // Create point material
+    const material = new StandardMaterial('selectionPointMat', scene)
+    material.emissiveColor = new Color3(0, 1, 1)
+    material.disableLighting = true
+    material.pointsCloud = true
+    material.pointSize = 4
+    
+    selectionPointCloud.material = material
+  }
+
+  /**
+   * Apply the selection proxy transform to the actual splat file data
+   * Called when gizmo drag ends
+   */
+  async function applySelectionProxyTransform(): Promise<boolean> {
+    if (!selectionProxyMesh || !selectionInitialTransform || !selectionInitialCenter) {
+      console.warn('[Babylon] Cannot apply selection transform - missing proxy data')
+      return false
+    }
+
+    // Calculate delta transform
+    const currentPos = selectionProxyMesh.position
+    const currentRot = selectionProxyMesh.rotationQuaternion || Quaternion.Identity()
+    const currentScale = selectionProxyMesh.scaling
+
+    const initialPos = selectionInitialTransform.position
+    const initialRot = selectionInitialTransform.rotation
+    const initialScale = selectionInitialTransform.scale
+
+    // Check if there's actually any change
+    const posChanged = !currentPos.equals(initialPos)
+    const rotChanged = !currentRot.equals(initialRot)
+    const scaleChanged = !currentScale.equals(initialScale)
+
+    if (!posChanged && !rotChanged && !scaleChanged) {
+      console.log('[Babylon] No selection transform change detected')
+      return true
+    }
+
+    // Calculate delta rotation = inverse(initial) * current
+    // This gives us the rotation to apply to points to move them from initial orientation to current
+    const initialRotInverse = initialRot.clone()
+    initialRotInverse.invertInPlace()
+    const deltaRot = initialRotInverse.multiply(currentRot)
+    
+    // Delta scale = current / initial
+    const deltaScale = new Vector3(
+      currentScale.x / (initialScale.x || 1),
+      currentScale.y / (initialScale.y || 1),
+      currentScale.z / (initialScale.z || 1)
+    )
+    
+    // Delta translation = current - initial
+    const deltaTranslation = currentPos.subtract(initialPos)
+
+    console.log('[Babylon] Applying selection transform:')
+    console.log('  Delta translation:', deltaTranslation.x.toFixed(3), deltaTranslation.y.toFixed(3), deltaTranslation.z.toFixed(3))
+    console.log('  Delta scale:', deltaScale.x.toFixed(3), deltaScale.y.toFixed(3), deltaScale.z.toFixed(3))
+
+    // Apply transform to selected splats in file
+    const result = await transformSelectedSplats(
+      selectionInitialCenter,
+      deltaTranslation,
+      deltaRot,
+      deltaScale
+    )
+
+    // Reset proxy transform for next drag
+    if (result) {
+      createOrUpdateSelectionProxy()
+    }
+
+    return result
+  }
+
+  /**
+   * Transform selected splats in the file data
+   * Modifies positions around pivot and rotates quaternions
+   */
+  async function transformSelectedSplats(
+    pivot: Vector3,
+    translation: Vector3,
+    rotation: Quaternion,
+    scale: Vector3
+  ): Promise<boolean> {
+    const originalFileBlob = getActiveBlob()
+    if (!originalFileBlob) {
+      console.error('[Babylon] No original file to transform')
+      return false
+    }
+
+    const selectedIndices = editorStore.selection.indices
+    if (selectedIndices.size === 0) {
+      console.log('[Babylon] No splats selected to transform')
+      return false
+    }
+
+    const activeId = editorStore.activeObjectId
+    if (!activeId) {
+      console.error('[Babylon] No active object to transform')
+      return false
+    }
+
+    try {
+      const arrayBuffer = await originalFileBlob.arrayBuffer()
+      const uint8 = new Uint8Array(arrayBuffer)
+      const header = new TextDecoder().decode(uint8.slice(0, 100))
+
+      if (header.startsWith('ply')) {
+        await transformPlySelected(uint8, selectedIndices, pivot, translation, rotation, scale)
+      } else {
+        await transformSplatFileSelected(uint8, selectedIndices, pivot, translation, rotation, scale)
+      }
+
+      // Update cached positions
+      await cacheSplatPositions(activeId)
+
+      // Refresh the selection point cloud with new positions
+      updateSelectionPointCloud()
+
+      return true
+    } catch (e) {
+      console.error('[Babylon] Failed to transform selected splats:', e)
+      return false
+    }
+  }
+
+  /**
+   * Transform selected vertices in a PLY file
+   */
+  async function transformPlySelected(
+    data: Uint8Array,
+    selectedIndices: Set<number>,
+    pivot: Vector3,
+    translation: Vector3,
+    rotation: Quaternion,
+    scale: Vector3
+  ): Promise<void> {
+    const headerEnd = findPlyHeaderEnd(data)
+    if (headerEnd < 0) {
+      throw new Error('Invalid PLY file')
+    }
+
+    const headerStr = new TextDecoder().decode(data.slice(0, headerEnd))
+    const vertexCountMatch = headerStr.match(/element vertex (\d+)/)
+    if (!vertexCountMatch) {
+      throw new Error('Invalid PLY file - no vertex count')
+    }
+
+    const properties = parsePlyProperties(headerStr)
+    const vertexSize = properties.reduce((sum, p) => sum + p.size, 0)
+
+    // Find position and rotation property offsets
+    const xProp = properties.find(p => p.name === 'x')
+    const yProp = properties.find(p => p.name === 'y')
+    const zProp = properties.find(p => p.name === 'z')
+    const rot0Prop = properties.find(p => p.name === 'rot_0')
+    const rot1Prop = properties.find(p => p.name === 'rot_1')
+    const rot2Prop = properties.find(p => p.name === 'rot_2')
+    const rot3Prop = properties.find(p => p.name === 'rot_3')
+
+    if (!xProp || !yProp || !zProp) {
+      throw new Error('PLY missing position properties')
+    }
+
+    const hasRotation = rot0Prop && rot1Prop && rot2Prop && rot3Prop
+
+    // Create a copy of the data to modify
+    const newData = new Uint8Array(data)
+    const dataView = new DataView(newData.buffer, newData.byteOffset + headerEnd)
+
+    const tempPos = new Vector3()
+    const rotatedPos = new Vector3()
+
+    for (const idx of selectedIndices) {
+      const offset = idx * vertexSize
+
+      // Read current position (with Y negation for Babylon.js coordinate system)
+      const x = dataView.getFloat32(offset + xProp.offset, true)
+      const y = -dataView.getFloat32(offset + yProp.offset, true)  // Negate Y
+      const z = dataView.getFloat32(offset + zProp.offset, true)
+
+      // Transform position around pivot
+      tempPos.set(x - pivot.x, y - pivot.y, z - pivot.z)
+      tempPos.x *= scale.x
+      tempPos.y *= scale.y
+      tempPos.z *= scale.z
+      tempPos.rotateByQuaternionToRef(rotation, rotatedPos)
+      
+      const newX = rotatedPos.x + pivot.x + translation.x
+      const newY = rotatedPos.y + pivot.y + translation.y
+      const newZ = rotatedPos.z + pivot.z + translation.z
+
+      // Write back (with Y negation)
+      dataView.setFloat32(offset + xProp.offset, newX, true)
+      dataView.setFloat32(offset + yProp.offset, -newY, true)  // Negate Y back
+      dataView.setFloat32(offset + zProp.offset, newZ, true)
+
+      // Transform rotation quaternion if present
+      // The delta rotation is in Babylon space (Y-negated from PLY)
+      // We need to convert it to PLY space before applying to PLY quaternions
+      if (hasRotation) {
+        const q0 = dataView.getFloat32(offset + rot0Prop!.offset, true)  // w
+        const q1 = dataView.getFloat32(offset + rot1Prop!.offset, true)  // x
+        const q2 = dataView.getFloat32(offset + rot2Prop!.offset, true)  // y
+        const q3 = dataView.getFloat32(offset + rot3Prop!.offset, true)  // z
+
+        // PLY quaternion format: rot_0=w, rot_1=x, rot_2=y, rot_3=z
+        // Babylon Quaternion constructor: (x, y, z, w)
+        const originalQuat = new Quaternion(q1, q2, q3, q0)
+        
+        // Convert delta rotation from Babylon space to PLY space
+        // Since positions use Y-negation, rotations need the same conversion:
+        // For Y-negation, negate the Y component of the quaternion's imaginary part
+        const rotationInPlySpace = new Quaternion(rotation.x, -rotation.y, rotation.z, rotation.w)
+        
+        // Apply delta rotation in PLY space: newQuat = rotationPLY * originalQuat
+        const newQuat = rotationInPlySpace.multiply(originalQuat)
+        newQuat.normalize()
+
+        // Write back in PLY format: rot_0=w, rot_1=x, rot_2=y, rot_3=z
+        dataView.setFloat32(offset + rot0Prop!.offset, newQuat.w, true)
+        dataView.setFloat32(offset + rot1Prop!.offset, newQuat.x, true)
+        dataView.setFloat32(offset + rot2Prop!.offset, newQuat.y, true)
+        dataView.setFloat32(offset + rot3Prop!.offset, newQuat.z, true)
+      }
+    }
+
+    // Update original file blob and reload
+    const activeId = editorStore.activeObjectId
+    const fileName = getActiveFileName() || 'transformed.ply'
+    const newBlob = new Blob([newData], { type: 'application/octet-stream' })
+    if (activeId) {
+      storeOriginalFile(activeId, newBlob, fileName)
+    }
+
+    const url = URL.createObjectURL(newBlob)
+    await loadSplat(url, fileName, false, true)
+    URL.revokeObjectURL(url)
+  }
+
+  /**
+   * Transform selected vertices in a .splat file (antimatter15 format)
+   */
+  async function transformSplatFileSelected(
+    data: Uint8Array,
+    selectedIndices: Set<number>,
+    pivot: Vector3,
+    translation: Vector3,
+    rotation: Quaternion,
+    scale: Vector3
+  ): Promise<void> {
+    const bytesPerSplat = 32
+    const splatCount = Math.floor(data.length / bytesPerSplat)
+
+    // Create a copy of the data to modify
+    const newData = new Uint8Array(data)
+    const dataView = new DataView(newData.buffer, newData.byteOffset)
+
+    const tempPos = new Vector3()
+    const rotatedPos = new Vector3()
+
+    for (const idx of selectedIndices) {
+      if (idx >= splatCount) continue
+
+      const offset = idx * bytesPerSplat
+
+      // Read current position (with Y negation)
+      const x = dataView.getFloat32(offset, true)
+      const y = -dataView.getFloat32(offset + 4, true)  // Negate Y
+      const z = dataView.getFloat32(offset + 8, true)
+
+      // Transform position around pivot
+      tempPos.set(x - pivot.x, y - pivot.y, z - pivot.z)
+      tempPos.x *= scale.x
+      tempPos.y *= scale.y
+      tempPos.z *= scale.z
+      tempPos.rotateByQuaternionToRef(rotation, rotatedPos)
+      
+      const newX = rotatedPos.x + pivot.x + translation.x
+      const newY = rotatedPos.y + pivot.y + translation.y
+      const newZ = rotatedPos.z + pivot.z + translation.z
+
+      // Write back (with Y negation)
+      dataView.setFloat32(offset, newX, true)
+      dataView.setFloat32(offset + 4, -newY, true)  // Negate Y back
+      dataView.setFloat32(offset + 8, newZ, true)
+
+      // Note: .splat format doesn't store explicit rotation quaternions
+      // The covariance/scale data at bytes 12-23 would need different handling
+      // For now, only position transforms are applied to .splat files
+    }
+
+    // Update original file blob and reload
+    const activeId = editorStore.activeObjectId
+    const fileName = getActiveFileName() || 'transformed.splat'
+    const newBlob = new Blob([newData], { type: 'application/octet-stream' })
+    if (activeId) {
+      storeOriginalFile(activeId, newBlob, fileName)
+    }
+
+    const url = URL.createObjectURL(newBlob)
+    await loadSplat(url, fileName, false, true)
+    URL.revokeObjectURL(url)
+  }
+
+  /**
+   * Find all splat indices within a sphere centered at the given position
+   */
+  function getSplatsInSphere(center: Vector3, radius: number): number[] {
+    const posData = getSplatPositions()
+    if (!posData) {
+      return []
+    }
+
+    const { positions: cachedSplatPositions, count: cachedSplatCount } = posData
+    const radiusSq = radius * radius
+    const indices: number[] = []
+
+    for (let i = 0; i < cachedSplatCount; i++) {
+      const x = cachedSplatPositions[i * 3]
+      const y = cachedSplatPositions[i * 3 + 1]
+      const z = cachedSplatPositions[i * 3 + 2]
+
+      const dx = x - center.x
+      const dy = y - center.y
+      const dz = z - center.z
+      const distSq = dx * dx + dy * dy + dz * dz
+
+      if (distSq <= radiusSq) {
+        indices.push(i)
+      }
+    }
+
+    return indices
+  }
+
+  /**
+   * Add splats within the current brush position to selection
+   */
+  function selectSplatsInBrush(): number {
+    if (!selectionBrushMesh || !selectionBrushMesh.isEnabled()) {
+      return 0
+    }
+
+    const brushPos = selectionBrushMesh.position
+    const brushRadius = editorStore.selection.brushRadius
+    const indices = getSplatsInSphere(brushPos, brushRadius)
+
+    if (indices.length > 0) {
+      editorStore.addToSelection(indices)
+    }
+
+    return indices.length
+  }
+
+  /**
+   * Remove splats within the current brush position from selection
+   */
+  function deselectSplatsInBrush(): number {
+    if (!selectionBrushMesh || !selectionBrushMesh.isEnabled()) {
+      return 0
+    }
+
+    const brushPos = selectionBrushMesh.position
+    const brushRadius = editorStore.selection.brushRadius
+    const indices = getSplatsInSphere(brushPos, brushRadius)
+
+    if (indices.length > 0) {
+      editorStore.removeFromSelection(indices)
+    }
+
+    return indices.length
+  }
+
+  /**
+   * Handle brush painting based on current mode
+   * Returns the number of splats affected
+   */
+  function paintWithBrush(): number {
+    const mode = editorStore.selection.brushMode
+    if (mode === 'add') {
+      return selectSplatsInBrush()
+    } else {
+      return deselectSplatsInBrush()
+    }
+  }
+
+  /**
+   * Update brush position from screen coordinates
+   * Note: This is now handled automatically by the pointer observable
+   * when the brush is enabled. This function is kept for manual control if needed.
+   */
+  function updateBrushFromScreenPosition(screenX: number, screenY: number): boolean {
+    const position = findBrushPositionFromPointer(screenX, screenY)
+    if (position) {
+      setSelectionBrushPosition(position.x, position.y, position.z)
+      return true
+    }
+    return false
+  }
+
+  /**
+   * Delete selected splats from the file and reload
+   * Returns the count of remaining splats, or null on error
+   */
+  async function deleteSelectedSplats(): Promise<{ originalCount: number; remainingCount: number } | null> {
+    const originalFileBlob = getActiveBlob()
+    if (!originalFileBlob) {
+      console.error('[Babylon] No original file to delete from')
+      return null
+    }
+
+    const selectedIndices = editorStore.selection.indices
+    if (selectedIndices.size === 0) {
+      console.log('[Babylon] No splats selected to delete')
+      return null
+    }
+
+    const activeId = editorStore.activeObjectId
+    if (!activeId) {
+      console.error('[Babylon] No active object to delete from')
+      return null
+    }
+
+    try {
+      const arrayBuffer = await originalFileBlob.arrayBuffer()
+      const uint8 = new Uint8Array(arrayBuffer)
+      const header = new TextDecoder().decode(uint8.slice(0, 100))
+
+      let result: { originalCount: number; remainingCount: number }
+      if (header.startsWith('ply')) {
+        result = await deletePlySelected(uint8, selectedIndices)
+      } else {
+        result = await deleteSplatFileSelected(uint8, selectedIndices)
+      }
+
+      // Clear selection after delete
+      editorStore.clearSelection()
+      clearSelectionPointCloud()
+
+      // Re-cache positions from the new file
+      await cacheSplatPositions(activeId)
+
+      return result
+    } catch (e) {
+      console.error('[Babylon] Failed to delete selected splats:', e)
+      return null
+    }
+  }
+
+  async function deletePlySelected(
+    data: Uint8Array,
+    selectedIndices: Set<number>
+  ): Promise<{ originalCount: number; remainingCount: number }> {
+    const headerEnd = findPlyHeaderEnd(data)
+    if (headerEnd < 0) {
+      throw new Error('Invalid PLY file')
+    }
+
+    const headerStr = new TextDecoder().decode(data.slice(0, headerEnd))
+    const vertexCountMatch = headerStr.match(/element vertex (\d+)/)
+    if (!vertexCountMatch) {
+      throw new Error('Invalid PLY file - no vertex count')
+    }
+
+    const originalCount = parseInt(vertexCountMatch[1])
+    const properties = parsePlyProperties(headerStr)
+    const vertexSize = properties.reduce((sum, p) => sum + p.size, 0)
+
+    // Find indices to keep (not selected)
+    const keepIndices: number[] = []
+    for (let i = 0; i < originalCount; i++) {
+      if (!selectedIndices.has(i)) {
+        keepIndices.push(i)
+      }
+    }
+
+    const remainingCount = keepIndices.length
+    console.log('[Babylon] PLY delete: keeping', remainingCount, 'of', originalCount, 'splats')
+
+    // Build new PLY file
+    const newHeader = headerStr.replace(
+      /element vertex \d+/,
+      `element vertex ${remainingCount}`
+    )
+    const newHeaderBytes = new TextEncoder().encode(newHeader)
+    
+    const newDataSize = remainingCount * vertexSize
+    const newFile = new Uint8Array(newHeaderBytes.length + newDataSize)
+    newFile.set(newHeaderBytes)
+    
+    const dataStart = headerEnd
+    
+    // Copy vertex data for kept vertices
+    for (let i = 0; i < keepIndices.length; i++) {
+      const srcOffset = dataStart + keepIndices[i] * vertexSize
+      const dstOffset = newHeaderBytes.length + i * vertexSize
+      newFile.set(data.slice(srcOffset, srcOffset + vertexSize), dstOffset)
+    }
+
+    // Update original file blob and reload
+    const activeId = editorStore.activeObjectId
+    const fileName = getActiveFileName() || 'edited.ply'
+    const newBlob = new Blob([newFile], { type: 'application/octet-stream' })
+    if (activeId) {
+      storeOriginalFile(activeId, newBlob, fileName)
+    }
+
+    const url = URL.createObjectURL(newBlob)
+    await loadSplat(url, fileName, false, true)
+    URL.revokeObjectURL(url)
+
+    return { originalCount, remainingCount }
+  }
+
+  async function deleteSplatFileSelected(
+    data: Uint8Array,
+    selectedIndices: Set<number>
+  ): Promise<{ originalCount: number; remainingCount: number }> {
+    const bytesPerSplat = 32
+    const originalCount = Math.floor(data.length / bytesPerSplat)
+
+    // Find indices to keep (not selected)
+    const keepIndices: number[] = []
+    for (let i = 0; i < originalCount; i++) {
+      if (!selectedIndices.has(i)) {
+        keepIndices.push(i)
+      }
+    }
+
+    const remainingCount = keepIndices.length
+    console.log('[Babylon] Splat delete: keeping', remainingCount, 'of', originalCount, 'splats')
+
+    // Build new file
+    const newData = new Uint8Array(remainingCount * bytesPerSplat)
+    
+    for (let i = 0; i < keepIndices.length; i++) {
+      const srcOffset = keepIndices[i] * bytesPerSplat
+      const dstOffset = i * bytesPerSplat
+      newData.set(data.slice(srcOffset, srcOffset + bytesPerSplat), dstOffset)
+    }
+
+    // Update original file blob and reload
+    const activeId = editorStore.activeObjectId
+    const fileName = getActiveFileName() || 'edited.splat'
+    const newBlob = new Blob([newData], { type: 'application/octet-stream' })
+    if (activeId) {
+      storeOriginalFile(activeId, newBlob, fileName)
+    }
+
+    const url = URL.createObjectURL(newBlob)
+    await loadSplat(url, fileName, false, true)
+    URL.revokeObjectURL(url)
+
+    return { originalCount, remainingCount }
+  }
+
+  // Fixed ID for preview splats - ensures we replace instead of accumulate
+  // Must match the ID used in sceneStore.addOrUpdatePreview()
+  const PREVIEW_SPLAT_ID = 'preview'
+
+  async function loadSplat(url: string, name: string, isPreview: boolean = false, isInternalReload: boolean = false, existingId?: string): Promise<string | null> {
     if (!scene) {
       console.error('[Babylon] Cannot load splat - scene not initialized')
-      return
+      return null
     }
 
     console.log('[Babylon] Loading splat:', name, 'from:', url, 'isPreview:', isPreview)
 
-    // Dispose existing splat mesh properly
-    if (currentSplat) {
-      console.log('[Babylon] Disposing previous splat mesh')
-      currentSplat.dispose()
-      currentSplat = null
+    // For previews, always use the fixed preview ID so we replace instead of accumulate
+    // For internal reloads, use the existing ID; for new loads, generate new ID
+    let objectId: string
+    if (isPreview) {
+      objectId = PREVIEW_SPLAT_ID
+    } else if (existingId) {
+      objectId = existingId
+    } else if (isInternalReload && editorStore.activeObjectId) {
+      objectId = editorStore.activeObjectId
+    } else {
+      objectId = crypto.randomUUID()
+      // When loading a non-preview (final) splat, dispose any existing preview
+      const existingPreview = splats.get(PREVIEW_SPLAT_ID)
+      if (existingPreview) {
+        console.log('[Babylon] Disposing preview splat before loading final result')
+        existingPreview.dispose()
+        splats.delete(PREVIEW_SPLAT_ID)
+        // Also clear preview from scene hierarchy
+        sceneStore.clearPreview()
+      }
     }
+    
+    // Keep reference to old mesh for this ID for disposal after new one is ready
+    const oldSplat = splats.get(objectId)
     
     // Clear debug mesh if exists
     if (debugMesh) {
@@ -1571,14 +3036,9 @@ export function useBabylon() {
       clearColmapPreview()
     }
 
-    // Only clear scene store for non-preview loads
-    if (!isPreview) {
-      sceneStore.clearAll()
-    }
-
     try {
-      // Only show loading indicator for non-preview loads
-      if (!isPreview) {
+      // Only show loading indicator for non-preview loads (and not internal reloads to avoid flicker)
+      if (!isPreview && !isInternalReload) {
         appStore.isLoading = true
       }
 
@@ -1588,29 +3048,53 @@ export function useBabylon() {
         try {
           const response = await fetch(url)
           const blob = await response.blob()
-          storeOriginalFile(blob, name)
+          storeOriginalFile(objectId, blob, name)
         } catch (e) {
           console.warn('[Babylon] Could not store original file:', e)
         }
       }
 
-      // Create new Gaussian Splatting mesh
-      currentSplat = new GaussianSplattingMesh(name, null, scene)
+      // Create new Gaussian Splatting mesh FIRST (before disposing old one)
+      const newSplat = new GaussianSplattingMesh(name, null, scene)
       console.log('[Babylon] GaussianSplattingMesh created, loading file...')
       
-      await currentSplat.loadFileAsync(url)
-      console.log('[Babylon] File loaded successfully')
+      try {
+        await newSplat.loadFileAsync(url)
+        console.log('[Babylon] File loaded successfully')
+      } catch (loadError) {
+        // Clean up the partially created mesh on load failure
+        newSplat.dispose()
+        throw loadError
+      }
+      
+      // NOW dispose the old mesh (after new one is ready) to avoid flicker
+      if (oldSplat) {
+        console.log('[Babylon] Disposing previous splat mesh for', objectId)
+        oldSplat.dispose()
+      }
+      
+      // Store the new splat in the map
+      splats.set(objectId, newSplat)
+      
+      // Set this splat as active (if not a preview)
+      if (!isPreview) {
+        editorStore.setActiveObject(objectId)
+      }
 
       // Get splat count
-      const splatCount = currentSplat.getScene() ? 
-        (currentSplat as any)._covariancesATexture?.getSize()?.width || 0 : 0
+      const splatCount = newSplat.getScene() ? 
+        (newSplat as any)._covariancesATexture?.getSize()?.width || 0 : 0
 
       console.log('[Babylon] Splat count:', splatCount)
 
-      // Only add to scene store for non-preview loads, or update existing for previews
-      if (!isPreview) {
+      // Update scene store based on load type
+      if (isInternalReload) {
+        // Internal reload just updates the existing object's splat count
+        sceneStore.updateSplatCount(splatCount)
+      } else if (!isPreview) {
+        // New non-preview load adds a new object
         sceneStore.addObject({
-          id: crypto.randomUUID(),
+          id: objectId,
           name: name,
           visible: true,
           splatCount: splatCount
@@ -1620,32 +3104,130 @@ export function useBabylon() {
         sceneStore.updatePreviewSplatCount(splatCount)
       }
 
-      // Focus camera on splat (only on first load or non-preview)
-      if ((orbitCamera || flyCamera) && currentSplat.getBoundingInfo()) {
-        // Only reposition camera for first preview or non-preview loads
-        if (!isPreview || !sceneStore.hasPreviewObject) {
+      // Focus camera on splat (only on first load, not for internal reloads or previews)
+      if ((orbitCamera || flyCamera) && newSplat.getBoundingInfo()) {
+        // Only reposition camera for first preview or non-preview loads (not internal reloads)
+        if (!isInternalReload && (!isPreview || !sceneStore.hasPreviewObject)) {
           focusCamera()
         }
       }
+
+      // Cache splat positions for selection tool (only for non-preview, non-internal reloads)
+      if (!isPreview && !isInternalReload && originalBlobs.has(objectId)) {
+        await cacheSplatPositions(objectId)
+      }
+      
+      return objectId
     } catch (error) {
       console.error('[Babylon] Failed to load splat:', error)
       if (!isPreview) {
         appStore.error = 'Failed to load splat file'
-        // Show debug cube on error
-        showDebugCube(true)
+        // Only show debug cube if we don't have any splats
+        if (splats.size === 0) {
+          showDebugCube(true)
+        }
       }
+      return null
     } finally {
-      if (!isPreview) {
+      if (!isPreview && !isInternalReload) {
         appStore.isLoading = false
       }
     }
   }
 
+  /**
+   * Remove a specific splat by ID
+   */
+  function removeSplat(id: string) {
+    const mesh = splats.get(id)
+    if (mesh) {
+      console.log('[Babylon] Disposing splat mesh:', id)
+      mesh.dispose()
+      splats.delete(id)
+    }
+    
+    // Clean up associated data
+    originalBlobs.delete(id)
+    originalFileNames.delete(id)
+    positionCaches.delete(id)
+    splatCounts.delete(id)
+    
+    // Remove from scene store
+    sceneStore.removeObject(id)
+    
+    // If this was the active object, clear active selection
+    if (editorStore.activeObjectId === id) {
+      // Set active to next available splat, or null if none
+      const remainingIds = Array.from(splats.keys())
+      editorStore.setActiveObject(remainingIds.length > 0 ? remainingIds[0] : null)
+    }
+  }
+
+  /**
+   * Clear all splats from the scene
+   */
+  function clearAllSplats() {
+    console.log('[Babylon] Clearing all splats')
+    
+    // Dispose all meshes
+    for (const [id, mesh] of splats) {
+      console.log('[Babylon] Disposing splat:', id)
+      mesh.dispose()
+    }
+    
+    // Clear all maps
+    splats.clear()
+    originalBlobs.clear()
+    originalFileNames.clear()
+    positionCaches.clear()
+    splatCounts.clear()
+    
+    // Clear stores
+    sceneStore.clearAll()
+    editorStore.clearActiveObject()
+    
+    // Clear selection-related state
+    clearSelectionPointCloud()
+    disposeSelectionProxy()
+  }
+
+  /**
+   * Set visibility of a specific splat by ID
+   */
+  function setSplatVisibility(id: string, visible: boolean) {
+    const mesh = splats.get(id)
+    if (mesh) {
+      mesh.setEnabled(visible)
+      // Also update scene store
+      const obj = sceneStore.objects.find(o => o.id === id)
+      if (obj) {
+        obj.visible = visible
+      }
+      console.log('[Babylon] Set splat visibility:', id, visible)
+    }
+  }
+
+  /**
+   * Toggle visibility of a specific splat by ID
+   */
+  function toggleSplatVisibility(id: string) {
+    const mesh = splats.get(id)
+    if (mesh) {
+      const newVisible = !mesh.isEnabled()
+      mesh.setEnabled(newVisible)
+      // Also update scene store
+      sceneStore.toggleVisibility(id)
+      console.log('[Babylon] Toggled splat visibility:', id, newVisible)
+    }
+  }
+
+  /**
+   * Legacy function - clears active splat (kept for compatibility)
+   */
   function clearSplat(clearStore: boolean = true) {
-    if (currentSplat) {
-      console.log('[Babylon] Disposing splat mesh in clearSplat')
-      currentSplat.dispose()
-      currentSplat = null
+    const activeId = editorStore.activeObjectId
+    if (activeId) {
+      removeSplat(activeId)
     }
     if (clearStore) {
       sceneStore.clearAll()
@@ -1653,6 +3235,12 @@ export function useBabylon() {
   }
 
   function dispose() {
+    // Remove global pointer observer
+    if (scene && globalPointerObserver) {
+      scene.onPointerObservable.remove(globalPointerObserver)
+      globalPointerObserver = null
+    }
+    
     clearSplat()
     scene?.dispose()
     engine?.dispose()
@@ -1677,7 +3265,7 @@ export function useBabylon() {
   }
 
   function getCurrentSplat() {
-    return currentSplat
+    return getActiveSplat()
   }
 
   /**
@@ -1733,6 +3321,7 @@ export function useBabylon() {
     let targetPos = target || Vector3.Zero()
     let dist = distance || 10
 
+    const currentSplat = getActiveSplat()
     if (!target && currentSplat) {
       try {
         const boundingInfo = currentSplat.getBoundingInfo()
@@ -1773,6 +3362,25 @@ export function useBabylon() {
   // ============================================
 
   /**
+   * Transform COLMAP coordinates to match OpenSplat/Babylon.js coordinate system
+   * COLMAP uses a different convention that needs to be flipped on X and Y axes
+   */
+  function transformColmapPosition(x: number, y: number, z: number): Vector3 {
+    // Flip X and Y to match the final splat output coordinate system
+    return new Vector3(-x, -y, z)
+  }
+
+  /**
+   * Transform COLMAP quaternion to match OpenSplat/Babylon.js coordinate system
+   */
+  function transformColmapRotation(qx: number, qy: number, qz: number, qw: number): Quaternion {
+    // When we flip X and Y axes, we need to adjust the quaternion accordingly
+    // Flipping X and Y is equivalent to a 180-degree rotation around Z axis
+    // This changes the sign of qx and qy components
+    return new Quaternion(-qx, -qy, qz, qw)
+  }
+
+  /**
    * Create a camera frustum wireframe with image plane
    */
   function createCameraFrustum(
@@ -1788,10 +3396,11 @@ export function useBabylon() {
     // COLMAP stores camera-to-world transform, we need to convert
     // Position is the camera center in world space
     // Rotation quaternion transforms from camera to world coordinates
-    const position = new Vector3(cam.position[0], cam.position[1], cam.position[2])
+    // Apply coordinate system transformation to match final splat output
+    const position = transformColmapPosition(cam.position[0], cam.position[1], cam.position[2])
     
-    // Convert quaternion [qx, qy, qz, qw] to Babylon Quaternion
-    const rotation = new Quaternion(cam.rotation[0], cam.rotation[1], cam.rotation[2], cam.rotation[3])
+    // Convert quaternion [qx, qy, qz, qw] to Babylon Quaternion with coordinate transform
+    const rotation = transformColmapRotation(cam.rotation[0], cam.rotation[1], cam.rotation[2], cam.rotation[3])
     
     // Calculate frustum size based on focal length and image dimensions
     const aspectRatio = cam.width / cam.height
@@ -1898,7 +3507,9 @@ export function useBabylon() {
     const colors: number[] = []
 
     for (const point of points) {
-      positions.push(point.x, point.y, point.z)
+      // Apply coordinate system transformation to match final splat output
+      const transformed = transformColmapPosition(point.x, point.y, point.z)
+      positions.push(transformed.x, transformed.y, transformed.z)
       // Convert 0-255 to 0-1
       colors.push(point.r / 255, point.g / 255, point.b / 255, 1)
     }
@@ -1964,17 +3575,19 @@ export function useBabylon() {
 
     // Focus camera on the preview
     if ((orbitCamera || flyCamera) && data.points3D.length > 0) {
-      // Calculate bounding box of points
+      // Calculate bounding box of transformed points
       let minX = Infinity, minY = Infinity, minZ = Infinity
       let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity
       
       for (const point of data.points3D) {
-        minX = Math.min(minX, point.x)
-        minY = Math.min(minY, point.y)
-        minZ = Math.min(minZ, point.z)
-        maxX = Math.max(maxX, point.x)
-        maxY = Math.max(maxY, point.y)
-        maxZ = Math.max(maxZ, point.z)
+        // Use transformed coordinates for bounding box
+        const transformed = transformColmapPosition(point.x, point.y, point.z)
+        minX = Math.min(minX, transformed.x)
+        minY = Math.min(minY, transformed.y)
+        minZ = Math.min(minZ, transformed.z)
+        maxX = Math.max(maxX, transformed.x)
+        maxY = Math.max(maxY, transformed.y)
+        maxZ = Math.max(maxZ, transformed.z)
       }
 
       const center = new Vector3(
@@ -2031,6 +3644,11 @@ export function useBabylon() {
     isSceneReady,
     focusCamera,
     switchCameraMode,
+    // Multi-splat management
+    removeSplat,
+    clearAllSplats,
+    setSplatVisibility,
+    toggleSplatVisibility,
     // COLMAP preview functions
     loadColmapPreview,
     clearColmapPreview,
@@ -2059,6 +3677,23 @@ export function useBabylon() {
     storeOriginalFile,
     // Bake transform
     bakeTransformToVertices,
-    centerAtOrigin
+    centerAtOrigin,
+    // Selection
+    createSelectionBrush,
+    setSelectionBrushVisible,
+    updateSelectionBrushRadius,
+    setSelectionBrushPosition,
+    findBrushPositionFromPointer,
+    setupSelectionPointerObservable,
+    removeSelectionPointerObservable,
+    getSplatPositions,
+    updateSelectionPointCloud,
+    clearSelectionPointCloud,
+    getSplatsInSphere,
+    selectSplatsInBrush,
+    deselectSplatsInBrush,
+    paintWithBrush,
+    updateBrushFromScreenPosition,
+    deleteSelectedSplats
   }
 }

@@ -20,6 +20,10 @@ export function useGenerator() {
   const hasResult = computed(() => generatorStore.result !== null)
   const isGenerating = computed(() => generatorStore.isGenerating)
   const progress = computed(() => generatorStore.progress)
+  
+  // Track the loaded result URL to prevent double-loading
+  let loadedResultUrl: string | null = null
+  let loadedResultBlob: Blob | null = null
 
   /**
    * Load generation result into the Babylon scene
@@ -32,19 +36,32 @@ export function useGenerator() {
 
     try {
       let splatBlob: Blob
-      let url: string
 
       // Check if result came from backend (has _blob property)
       if (result._blob) {
-        console.log('[useGenerator] Loading backend result blob')
         splatBlob = result._blob
-        url = URL.createObjectURL(splatBlob)
       } else {
         // Convert browser result to .splat format
-        console.log('[useGenerator] Converting browser result to splat')
         splatBlob = exportToSplat(result)
-        url = URL.createObjectURL(splatBlob)
       }
+      
+      // Check if we've already loaded this exact blob
+      if (loadedResultBlob === splatBlob && loadedResultUrl) {
+        console.log('[useGenerator] Result already loaded, skipping duplicate load')
+        return true
+      }
+      
+      // Clean up previous URL if exists
+      if (loadedResultUrl) {
+        URL.revokeObjectURL(loadedResultUrl)
+      }
+      
+      // Create new URL for this result
+      const url = URL.createObjectURL(splatBlob)
+      loadedResultUrl = url
+      loadedResultBlob = splatBlob
+      
+      console.log('[useGenerator] Loading result blob:', splatBlob.size, 'bytes')
 
       // Update app store - the watcher in useBabylon will handle loading
       appStore.currentFile = {
@@ -60,6 +77,17 @@ export function useGenerator() {
       appStore.error = 'Failed to load generated splats'
       return false
     }
+  }
+  
+  /**
+   * Reset loaded result tracking (call when starting new generation)
+   */
+  function resetLoadedResult() {
+    if (loadedResultUrl) {
+      URL.revokeObjectURL(loadedResultUrl)
+    }
+    loadedResultUrl = null
+    loadedResultBlob = null
   }
 
   /**
@@ -128,6 +156,7 @@ export function useGenerator() {
    * Clear generation result
    */
   function clearResult() {
+    resetLoadedResult()
     generatorStore.reset()
   }
 
@@ -139,6 +168,7 @@ export function useGenerator() {
 
     // Actions
     loadResultToScene,
+    resetLoadedResult,
     downloadAsPly,
     downloadAsSplat,
     getSplatCount,

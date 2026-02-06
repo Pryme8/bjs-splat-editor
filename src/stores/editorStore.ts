@@ -4,6 +4,7 @@ import { ref, computed } from 'vue'
 export type GizmoType = 'none' | 'rotate' | 'translate' | 'scale'
 export type TransformSpace = 'local' | 'world'
 export type CameraMode = 'fly' | 'orbit'
+export type BrushMode = 'add' | 'remove'
 
 export interface Transform {
   position: { x: number; y: number; z: number }
@@ -30,9 +31,19 @@ export interface ClipBox {
   size: { x: number; y: number; z: number }
 }
 
+export interface SelectionState {
+  indices: Set<number>
+  brushEnabled: boolean
+  brushRadius: number
+  brushMode: BrushMode
+}
+
 const MAX_HISTORY_SIZE = 50
 
 export const useEditorStore = defineStore('editor', () => {
+  // Active object (for multi-splat support)
+  const activeObjectId = ref<string | null>(null)
+  
   // View helpers
   const showAxes = ref(true)
   const showGroundPlane = ref(true)
@@ -71,8 +82,19 @@ export const useEditorStore = defineStore('editor', () => {
     size: { x: 5, y: 5, z: 5 }
   })
   
+  // Selection state
+  const selection = ref<SelectionState>({
+    indices: new Set<number>(),
+    brushEnabled: false,
+    brushRadius: 1,
+    brushMode: 'add'
+  })
+  
   // Computed helpers
+  const hasActiveObject = computed(() => activeObjectId.value !== null)
   const hasActiveGizmo = computed(() => activeGizmo.value !== 'none')
+  const selectionCount = computed(() => selection.value.indices.size)
+  const hasSelection = computed(() => selection.value.indices.size > 0)
   const canUndo = computed(() => undoStack.value.length > 0)
   const canRedo = computed(() => redoStack.value.length > 0)
   
@@ -122,6 +144,20 @@ export const useEditorStore = defineStore('editor', () => {
   
   function setCameraMode(mode: CameraMode) {
     cameraMode.value = mode
+  }
+  
+  // Active object actions
+  function setActiveObject(id: string | null) {
+    // Clear selection when switching objects
+    if (activeObjectId.value !== id) {
+      clearSelection()
+    }
+    activeObjectId.value = id
+  }
+  
+  function clearActiveObject() {
+    clearSelection()
+    activeObjectId.value = null
   }
   
   function setGroundPlaneSize(size: number) {
@@ -228,8 +264,67 @@ export const useEditorStore = defineStore('editor', () => {
     }
   }
   
+  // Selection actions
+  function toggleSelectionBrush() {
+    selection.value.brushEnabled = !selection.value.brushEnabled
+  }
+  
+  function setSelectionBrushEnabled(enabled: boolean) {
+    selection.value.brushEnabled = enabled
+  }
+  
+  function setSelectionBrushRadius(radius: number) {
+    selection.value.brushRadius = Math.max(0.1, radius)
+  }
+  
+  function setSelectionBrushMode(mode: BrushMode) {
+    selection.value.brushMode = mode
+  }
+  
+  function addToSelection(indices: number[]) {
+    for (const idx of indices) {
+      selection.value.indices.add(idx)
+    }
+  }
+  
+  function removeFromSelection(indices: number[]) {
+    for (const idx of indices) {
+      selection.value.indices.delete(idx)
+    }
+  }
+  
+  function clearSelection() {
+    selection.value.indices = new Set<number>()
+  }
+  
+  function selectAll(totalCount: number) {
+    selection.value.indices = new Set<number>(
+      Array.from({ length: totalCount }, (_, i) => i)
+    )
+  }
+  
+  function invertSelection(totalCount: number) {
+    const newSelection = new Set<number>()
+    for (let i = 0; i < totalCount; i++) {
+      if (!selection.value.indices.has(i)) {
+        newSelection.add(i)
+      }
+    }
+    selection.value.indices = newSelection
+  }
+  
+  function resetSelection() {
+    selection.value = {
+      indices: new Set<number>(),
+      brushEnabled: false,
+      brushRadius: 1,
+      brushMode: 'add'
+    }
+  }
+  
   return {
     // State
+    activeObjectId,
     showAxes,
     showGroundPlane,
     groundPlaneSize,
@@ -242,11 +337,14 @@ export const useEditorStore = defineStore('editor', () => {
     clipBox,
     
     // Computed
+    hasActiveObject,
     hasActiveGizmo,
     canUndo,
     canRedo,
     
     // Actions
+    setActiveObject,
+    clearActiveObject,
     toggleAxes,
     toggleGroundPlane,
     setActiveGizmo,
@@ -276,6 +374,21 @@ export const useEditorStore = defineStore('editor', () => {
     setClipBoxEnabled,
     setClipBoxCenter,
     setClipBoxSize,
-    resetClipBox
+    resetClipBox,
+    
+    // Selection
+    selection,
+    selectionCount,
+    hasSelection,
+    toggleSelectionBrush,
+    setSelectionBrushEnabled,
+    setSelectionBrushRadius,
+    setSelectionBrushMode,
+    addToSelection,
+    removeFromSelection,
+    clearSelection,
+    selectAll,
+    invertSelection,
+    resetSelection
   }
 })

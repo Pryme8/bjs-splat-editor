@@ -15,6 +15,9 @@ export const useAppStore = defineStore('app', () => {
   const error = ref<string | null>(null)
   const undoStack = ref<unknown[]>([])
   const redoStack = ref<unknown[]>([])
+  
+  // Panel visibility
+  const showRightPanel = ref(true)
 
   const hasScene = computed(() => currentFile.value !== null)
   const canUndo = computed(() => undoStack.value.length > 0)
@@ -99,11 +102,20 @@ export const useAppStore = defineStore('app', () => {
     }
     return state
   }
+  
+  function toggleRightPanel() {
+    showRightPanel.value = !showRightPanel.value
+  }
+  
+  function setRightPanelVisible(visible: boolean) {
+    showRightPanel.value = visible
+  }
 
   return {
     currentFile,
     isLoading,
     error,
+    showRightPanel,
     hasScene,
     canUndo,
     canRedo,
@@ -112,6 +124,8 @@ export const useAppStore = defineStore('app', () => {
     clearScene,
     pushUndo,
     undo,
-    redo
+    redo,
+    toggleRightPanel,
+    setRightPanelVisible
   }
 })

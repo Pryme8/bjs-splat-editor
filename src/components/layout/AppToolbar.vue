@@ -5,6 +5,7 @@ import { useSplatEditor } from '@/composables/useSplatEditor'
 
 const emit = defineEmits<{
   toggleSidebar: []
+  toggleRightPanel: []
 }>()
 
 const appStore = useAppStore()
@@ -118,9 +119,12 @@ function handleExport(format: 'ply' | 'splat') {
     <v-divider vertical class="mx-2" />
     
     <v-btn
-      icon="mdi-cog-outline"
+      :icon="appStore.showRightPanel ? 'mdi-dock-right' : 'mdi-dock-right'"
       size="small"
       variant="text"
+      :color="appStore.showRightPanel ? 'primary' : undefined"
+      title="Toggle Hierarchy Panel"
+      @click="emit('toggleRightPanel')"
     />
   </v-app-bar>
 </template>

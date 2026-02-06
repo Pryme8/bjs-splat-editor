@@ -39,6 +39,9 @@ async function handleDrop(e: DragEvent) {
     await appStore.loadFile(file)
   }
 }
+
+// Note: Selection brush pointer events are now handled automatically by
+// Babylon's scene.onPointerObservable when the brush is enabled
 </script>
 
 <template>

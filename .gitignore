@@ -50,3 +50,6 @@ coverage/
 training_data/
 outputs/
 jobs/
+
+# Backend data folder
+backend/data/
