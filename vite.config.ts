@@ -2,6 +2,7 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import vuetify from 'vite-plugin-vuetify'
 import { fileURLToPath, URL } from 'node:url'
+import { resolve } from 'path'
 
 export default defineConfig({
   plugins: [
@@ -18,6 +19,12 @@ export default defineConfig({
     open: true
   },
   build: {
-    target: 'esnext'
+    target: 'esnext',
+    rollupOptions: {
+      input: {
+        main: resolve(__dirname, 'index.html'),
+        viewer: resolve(__dirname, 'viewer.html')
+      }
+    }
   }
 })

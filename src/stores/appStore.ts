@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import type { SqpzFile } from '@/types/sqpz'
 
 export interface SplatFile {
   name: string
@@ -7,6 +8,7 @@ export interface SplatFile {
   type: 'ply' | 'splat' | 'spz'
   url: string
   isPreview?: boolean  // True for intermediate/preview files during generation
+  skipFlipPrompt?: boolean  // True for SQPZ imports that handle flip state via metadata
 }
 
 export const useAppStore = defineStore('app', () => {
@@ -19,6 +21,11 @@ export const useAppStore = defineStore('app', () => {
   // Panel visibility
   const showRightPanel = ref(true)
   const showConsolePanel = ref(false)  // Start collapsed
+  
+  // Viewer mode
+  const viewerMode = ref(false)
+  const currentSqpzData = ref<SqpzFile | null>(null)
+  const currentSqpzBuffers = ref<ArrayBuffer[]>([])
 
   const hasScene = computed(() => currentFile.value !== null)
   const canUndo = computed(() => undoStack.value.length > 0)
@@ -54,7 +61,7 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
-  async function loadFromBlob(blob: Blob, name: string = 'preview.ply', isPreview: boolean = true) {
+  async function loadFromBlob(blob: Blob, name: string = 'preview.ply', isPreview: boolean = true, skipFlipPrompt: boolean = false) {
     // Revoke previous URL if exists
     if (currentFile.value?.url) {
       URL.revokeObjectURL(currentFile.value.url)
@@ -68,10 +75,20 @@ export const useAppStore = defineStore('app', () => {
       size: blob.size,
       type: extension as 'ply' | 'splat' | 'spz',
       url,
-      isPreview
+      isPreview,
+      skipFlipPrompt
     }
     
-    console.log('[AppStore] Loaded blob as', name, 'size:', blob.size, 'isPreview:', isPreview)
+    console.log('[AppStore] Loaded blob as', name, 'size:', blob.size, 'isPreview:', isPreview, 'skipFlipPrompt:', skipFlipPrompt)
+  }
+
+  function setCurrentFile(file: SplatFile) {
+    // Revoke previous URL if exists
+    if (currentFile.value?.url) {
+      URL.revokeObjectURL(currentFile.value.url)
+    }
+    currentFile.value = file
+    console.log('[AppStore] Current file set to', file.name)
   }
 
   function clearScene() {
@@ -119,6 +136,19 @@ export const useAppStore = defineStore('app', () => {
   function setConsolePanelVisible(visible: boolean) {
     showConsolePanel.value = visible
   }
+  
+  function toggleViewerMode() {
+    viewerMode.value = !viewerMode.value
+  }
+  
+  function setViewerMode(enabled: boolean) {
+    viewerMode.value = enabled
+  }
+  
+  function setCurrentSqpzData(data: SqpzFile | null, buffers: ArrayBuffer[] = []) {
+    currentSqpzData.value = data
+    currentSqpzBuffers.value = buffers
+  }
 
   return {
     currentFile,
@@ -126,11 +156,15 @@ export const useAppStore = defineStore('app', () => {
     error,
     showRightPanel,
     showConsolePanel,
+    viewerMode,
+    currentSqpzData,
+    currentSqpzBuffers,
     hasScene,
     canUndo,
     canRedo,
     loadFile,
     loadFromBlob,
+    setCurrentFile,
     clearScene,
     pushUndo,
     undo,
@@ -138,6 +172,9 @@ export const useAppStore = defineStore('app', () => {
     toggleRightPanel,
     setRightPanelVisible,
     toggleConsolePanel,
-    setConsolePanelVisible
+    setConsolePanelVisible,
+    toggleViewerMode,
+    setViewerMode,
+    setCurrentSqpzData
   }
 })

@@ -4,6 +4,7 @@ import { useBabylon } from '@/composables/useBabylon'
 import { useAppStore } from '@/stores/appStore'
 import { useGeneratorStore } from '@/stores/generatorStore'
 import { useSplatEditor } from '@/composables/useSplatEditor'
+import SplatViewer from '@/components/viewer/SplatViewer.vue'
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const appStore = useAppStore()
@@ -14,8 +15,11 @@ const { initScene, dispose } = useBabylon()
 
 // Hide empty state when we have content OR we're generating (COLMAP preview shows during generation)
 const showEmptyState = computed(() => {
-  return !appStore.hasScene && !generatorStore.isGenerating
+  return !appStore.hasScene && !generatorStore.isGenerating && !appStore.viewerMode
 })
+
+// Show editor canvas (hide in viewer mode)
+const showEditorCanvas = computed(() => !appStore.viewerMode)
 
 onMounted(() => {
   if (canvasRef.value) {
@@ -50,7 +54,16 @@ async function handleDrop(e: DragEvent) {
     @dragover="handleDragOver"
     @drop="handleDrop"
   >
-    <canvas ref="canvasRef" />
+    <!-- Editor Canvas -->
+    <canvas v-show="showEditorCanvas" ref="canvasRef" />
+    
+    <!-- Viewer Component -->
+    <SplatViewer
+      v-if="appStore.viewerMode && appStore.currentSqpzData"
+      :sqpz-data="appStore.currentSqpzData"
+      :splat-buffers="appStore.currentSqpzBuffers"
+      :show-controls="true"
+    />
     
     <transition name="fade">
       <div v-if="appStore.isLoading" class="loading-overlay">
@@ -68,8 +81,8 @@ async function handleDrop(e: DragEvent) {
       <p class="text-grey-darken-1 text-caption">or use Import from the toolbar</p>
     </div>
 
-    <!-- Camera Controls Overlay -->
-    <div class="camera-overlay">
+    <!-- Camera Controls Overlay (only in editor mode) -->
+    <div v-if="showEditorCanvas" class="camera-overlay">
       <div class="camera-buttons">
         <v-btn
           :icon="editor.cameraMode.value === 'orbit' ? 'mdi-orbit' : 'mdi-orbit-variant'"

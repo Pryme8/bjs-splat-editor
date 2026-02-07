@@ -759,6 +759,10 @@ function clearAndGenerate() {
 
           <div class="progress-stats">
             <div class="stat">
+              <span class="stat-label">Time</span>
+              <span class="stat-value mono">{{ generatorStore.formattedElapsedTime || '0s' }}</span>
+            </div>
+            <div class="stat">
               <span class="stat-label">Iteration</span>
               <span class="stat-value mono">
                 {{ generatorStore.progress.currentIteration.toLocaleString() }} / {{ generatorStore.progress.totalIterations.toLocaleString() }}

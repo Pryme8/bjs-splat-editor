@@ -53,6 +53,12 @@ export interface LearnedFeaturesResult {
   // Device info
   device_type?: 'gpu' | 'cpu'
   device_name?: string
+  // EXIF camera info
+  exif_count?: number
+  camera_make?: string
+  camera_model?: string
+  focal_mm?: number
+  focal_pixels?: number
 }
 
 /**

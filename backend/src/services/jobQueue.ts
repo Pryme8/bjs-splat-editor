@@ -82,7 +82,10 @@ export async function initializeJobQueue(): Promise<void> {
 
     // Queue event handlers
     trainingQueue.on('completed', (job, result) => {
-      console.log(`[JobQueue] Job ${job.id} completed`)
+      const duration = result?.trainingTime 
+        ? ` in ${Math.round(result.trainingTime)}s` 
+        : ''
+      console.log(`[JobQueue] ✅ Job ${job.id} completed${duration}`)
       broadcastProgress({
         jobId: job.data.jobId,
         status: 'complete',
@@ -128,15 +131,24 @@ export async function addJobToQueue(jobData: {
   } else {
     // Direct processing without queue (fallback)
     console.log(`[JobQueue] Processing job ${jobData.jobId} directly (no Redis)`)
-    processTrainingJob(jobData, broadcastProgress).catch(err => {
-      console.error(`[JobQueue] Direct job ${jobData.jobId} failed:`, err)
-      broadcastProgress({
-        jobId: jobData.jobId,
-        status: 'failed',
-        progress: 0,
-        message: err.message
+    const directStartTime = Date.now()
+    
+    processTrainingJob(jobData, broadcastProgress)
+      .then(result => {
+        const duration = result?.trainingTime 
+          ? ` in ${Math.round(result.trainingTime)}s` 
+          : ''
+        console.log(`[JobQueue] ✅ Direct job ${jobData.jobId} completed${duration}`)
       })
-    })
+      .catch(err => {
+        console.error(`[JobQueue] Direct job ${jobData.jobId} failed:`, err)
+        broadcastProgress({
+          jobId: jobData.jobId,
+          status: 'failed',
+          progress: 0,
+          message: err.message
+        })
+      })
   }
 }
 

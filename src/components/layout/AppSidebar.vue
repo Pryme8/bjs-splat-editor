@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import GeneratorPanel from '@/components/panels/GeneratorPanel.vue'
 import ToolsPanel from '@/components/panels/ToolsPanel.vue'
+import ViewHelpersPanel from '@/components/panels/ViewHelpersPanel.vue'
 
 const activePanel = ref('tools')
 </script>
@@ -17,6 +18,9 @@ const activePanel = ref('tools')
       <v-tab value="tools" size="small" title="Tools">
         <v-icon size="small">mdi-wrench</v-icon>
       </v-tab>
+      <v-tab value="view" size="small" title="View Helpers">
+        <v-icon size="small">mdi-eye</v-icon>
+      </v-tab>
       <v-tab value="generator" size="small" title="Generator">
         <v-icon size="small">mdi-creation</v-icon>
       </v-tab>
@@ -26,6 +30,10 @@ const activePanel = ref('tools')
       <v-window v-model="activePanel" class="panel-window">
         <v-window-item value="tools">
           <ToolsPanel />
+        </v-window-item>
+        
+        <v-window-item value="view">
+          <ViewHelpersPanel />
         </v-window-item>
         
         <v-window-item value="generator">

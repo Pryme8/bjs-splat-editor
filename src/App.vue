@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
 import AppToolbar from './components/layout/AppToolbar.vue'
 import AppSidebar from './components/layout/AppSidebar.vue'
 import AppRightPanel from './components/layout/AppRightPanel.vue'
@@ -14,6 +14,38 @@ const sidebarOpen = ref(true)
 const editor = useSplatEditor()
 const appStore = useAppStore()
 const babylon = useBabylon()
+
+// Store panel states before entering viewer mode
+const panelStateBeforeViewer = ref({
+  sidebar: true,
+  rightPanel: true,
+  console: false
+})
+
+// Watch viewer mode changes to auto-hide/show panels
+watch(() => appStore.viewerMode, (isViewerMode) => {
+  if (isViewerMode) {
+    // Entering viewer mode - save current state and hide panels
+    panelStateBeforeViewer.value = {
+      sidebar: sidebarOpen.value,
+      rightPanel: appStore.showRightPanel,
+      console: appStore.showConsolePanel
+    }
+    sidebarOpen.value = false
+    appStore.setRightPanelVisible(false)
+    appStore.setConsolePanelVisible(false)
+  } else {
+    // Exiting viewer mode - restore panel states
+    sidebarOpen.value = panelStateBeforeViewer.value.sidebar
+    appStore.setRightPanelVisible(panelStateBeforeViewer.value.rightPanel)
+    appStore.setConsolePanelVisible(panelStateBeforeViewer.value.console)
+    
+    // Trigger editor engine resize after a brief delay to ensure panels are rendered
+    setTimeout(() => {
+      babylon.resizeEngine()
+    }, 250)
+  }
+})
 
 // Console panel height when open
 const consolePanelHeight = ref(180)

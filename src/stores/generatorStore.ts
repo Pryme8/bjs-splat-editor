@@ -40,6 +40,11 @@ export const useGeneratorStore = defineStore('generator', () => {
   const currentDeviceType = ref<'gpu' | 'cpu' | null>(null)
   const currentDeviceName = ref<string | null>(null)
   
+  // Timer for tracking generation duration
+  const startTime = ref<number | null>(null)
+  const elapsedTime = ref<number>(0)
+  let timerInterval: ReturnType<typeof setInterval> | null = null
+  
   // Watch intermediate results and update the 3D view
   watch(intermediateResult, async (newResult) => {
     if (newResult) {
@@ -91,6 +96,45 @@ export const useGeneratorStore = defineStore('generator', () => {
     // Auto mode: use backend if available
     return backendAvailable.value === true
   })
+  
+  const formattedElapsedTime = computed(() => {
+    const ms = elapsedTime.value
+    const seconds = Math.floor(ms / 1000)
+    const minutes = Math.floor(seconds / 60)
+    const hours = Math.floor(minutes / 60)
+    
+    if (hours > 0) {
+      return `${hours}h ${minutes % 60}m ${seconds % 60}s`
+    } else if (minutes > 0) {
+      return `${minutes}m ${seconds % 60}s`
+    } else {
+      return `${seconds}s`
+    }
+  })
+
+  // Timer helpers
+  function startTimer() {
+    console.log('[GeneratorStore] Starting timer...')
+    if (timerInterval) {
+      clearInterval(timerInterval)
+    }
+    startTime.value = Date.now()
+    elapsedTime.value = 0
+    timerInterval = setInterval(() => {
+      if (startTime.value) {
+        elapsedTime.value = Date.now() - startTime.value
+      }
+    }, 1000)
+    console.log('[GeneratorStore] Timer started, initial elapsed:', elapsedTime.value)
+  }
+  
+  function stopTimer() {
+    console.log('[GeneratorStore] Stopping timer at:', formattedElapsedTime.value)
+    if (timerInterval) {
+      clearInterval(timerInterval)
+      timerInterval = null
+    }
+  }
 
   // Actions
   async function checkBackendAvailable(retries = 2) {
@@ -148,6 +192,7 @@ export const useGeneratorStore = defineStore('generator', () => {
 
     error.value = null
     result.value = null
+    startTimer()
     
     if (useBackend.value) {
       await startBackendGeneration()
@@ -236,6 +281,7 @@ export const useGeneratorStore = defineStore('generator', () => {
             console.error('[GeneratorStore] handleBackendComplete threw:', e)
           }
         } else if (p.status === 'failed') {
+          stopTimer()
           progress.value = {
             stage: mapBackendStatus(p.status),
             currentIteration: p.iteration || 0,
@@ -278,6 +324,7 @@ export const useGeneratorStore = defineStore('generator', () => {
 
     } catch (e) {
       console.error('[GeneratorStore] Backend generation failed:', e)
+      stopTimer()
       error.value = (e as Error).message
       progress.value = {
         stage: 'error',
@@ -412,6 +459,8 @@ export const useGeneratorStore = defineStore('generator', () => {
           _splatCount: splatCount
         } as any
 
+        stopTimer()
+        
         progress.value = {
           stage: 'complete',
           currentIteration: config.value.iterations,
@@ -425,6 +474,7 @@ export const useGeneratorStore = defineStore('generator', () => {
         console.log('[GeneratorStore] Result ready, stage set to complete')
       } else {
         console.error('[GeneratorStore] Downloaded blob is empty or null')
+        stopTimer()
         error.value = 'Downloaded result file is empty'
         progress.value = {
           stage: 'error',
@@ -438,6 +488,7 @@ export const useGeneratorStore = defineStore('generator', () => {
       }
     } catch (e) {
       console.error('[GeneratorStore] Failed to download result:', e)
+      stopTimer()
       error.value = 'Failed to download result: ' + (e as Error).message
       progress.value = {
         stage: 'error',
@@ -477,6 +528,7 @@ export const useGeneratorStore = defineStore('generator', () => {
             splatCount: r.opacities.length
           })
           
+          stopTimer()
           result.value = r
           progress.value = {
             stage: 'complete',
@@ -490,6 +542,7 @@ export const useGeneratorStore = defineStore('generator', () => {
         },
         onError: (e) => {
           console.error('[GeneratorStore] Generation error:', e)
+          stopTimer()
           error.value = e.message
           progress.value = {
             stage: 'error',
@@ -504,11 +557,13 @@ export const useGeneratorStore = defineStore('generator', () => {
       })
     } catch (e) {
       console.error('[GeneratorStore] Exception:', e)
+      stopTimer()
       error.value = (e as Error).message
     }
   }
 
   function cancelGeneration() {
+    stopTimer()
     if (currentJobId.value) {
       BackendApi.CancelJob(currentJobId.value)
       BackendApi.UnsubscribeFromJob(currentJobId.value)
@@ -561,6 +616,8 @@ export const useGeneratorStore = defineStore('generator', () => {
       const arrayBuffer = await blob.arrayBuffer()
       const splatCount = Math.floor(arrayBuffer.byteLength / 250)
       
+      stopTimer()
+      
       // Update progress to complete
       progress.value = {
         stage: 'complete',
@@ -592,6 +649,7 @@ export const useGeneratorStore = defineStore('generator', () => {
     } else {
       // No intermediate result available, just cancel
       console.warn('[GeneratorStore] No intermediate result available, cancelling')
+      stopTimer()
       progress.value = {
         stage: 'cancelled',
         currentIteration: 0,
@@ -606,6 +664,7 @@ export const useGeneratorStore = defineStore('generator', () => {
   }
 
   function reset() {
+    stopTimer()
     if (currentJobId.value) {
       BackendApi.UnsubscribeFromJob(currentJobId.value)
       currentJobId.value = null
@@ -619,6 +678,8 @@ export const useGeneratorStore = defineStore('generator', () => {
     colmapPreviewFetched.value = false
     currentDeviceType.value = null
     currentDeviceName.value = null
+    startTime.value = null
+    elapsedTime.value = 0
     
     // Clear preview from scene store and dispose preview mesh
     const sceneStore = useSceneStore()
@@ -669,6 +730,7 @@ export const useGeneratorStore = defineStore('generator', () => {
     intermediateResult,
     currentDeviceType,
     currentDeviceName,
+    elapsedTime,
     
     // Computed
     isGenerating,
@@ -678,6 +740,7 @@ export const useGeneratorStore = defineStore('generator', () => {
     splatCount,
     isWebGPUSupported,
     useBackend,
+    formattedElapsedTime,
 
     // Actions
     checkBackendAvailable,

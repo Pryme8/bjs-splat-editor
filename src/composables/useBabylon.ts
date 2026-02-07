@@ -62,6 +62,7 @@ const originalBlobs = new Map<string, Blob>() // Pristine original files for res
 const originalFileNames = new Map<string, string>()
 const positionCaches = new Map<string, Float32Array>()
 const splatCounts = new Map<string, number>()
+const splatFlipStates = new Map<string, boolean>() // Track if splat was Y-flipped
 
 // COLMAP preview meshes
 let colmapPreviewMeshes: Mesh[] = []
@@ -126,6 +127,11 @@ const keysPressed = {
   moveUp: false,
   moveDown: false,
 }
+
+// Waypoint markers - camera frustum widgets in 3D space
+const waypointMarkers = new Map<string, Mesh>()  // keyed by waypoint ID
+const waypointTargetSpheres = new Map<string, Mesh>()  // target spheres for waypoints
+let waypointMarkersVisible = true
 
 export function useBabylon() {
   const isReady = ref(false)
@@ -206,27 +212,15 @@ export function useBabylon() {
     )
     orbitCamera.minZ = 0.01
     orbitCamera.maxZ = 500
-    orbitCamera.wheelPrecision = 50 // Base value, will be updated dynamically
+    orbitCamera.wheelPrecision = 50
     orbitCamera.panningSensibility = 500
-    orbitCamera.lowerRadiusLimit = 0.5
+    orbitCamera.lowerRadiusLimit = orbitCamera.minZ  // Match minimum distance to near clipping plane
     orbitCamera.upperRadiusLimit = 200
-    orbitCamera.attachControl(canvas, true)
     
-    // Dynamic wheel precision - zoom faster when far, slower when close relative to splat size
-    orbitCamera.onAfterCheckInputsObservable.add(() => {
-      const radius = orbitCamera!.radius
-      const splatSize = currentSplatRadius || 10
-      
-      // Ratio of camera distance to splat size
-      // When far (ratio > 3), zoom fast; when close (ratio < 0.5), zoom slow
-      const distanceRatio = radius / splatSize
-      
-      // wheelPrecision inversely proportional to distance ratio
-      // At ratio 0.1 (very close): precision ~100 (slow, precise)
-      // At ratio 1.0 (splat radius away): precision ~10  
-      // At ratio 5.0 (far away): precision ~2 (very fast)
-      orbitCamera!.wheelPrecision = 10 / Math.max(distanceRatio, 0.1)
-    })
+    // Use natural zoom - zoom speed is proportional to distance (faster when far, slower when close)
+    orbitCamera.useNaturalPinchZoom = true
+    
+    orbitCamera.attachControl(canvas, true)
     
     // ============================================
     // FLY CAMERA (6DOF drone mode)
@@ -312,10 +306,8 @@ export function useBabylon() {
       flyCamera.rotationQuaternion = pitchRotation.multiply(flyCamera.rotationQuaternion)
     })
     
-    // Track all keys for custom movement (fly camera only)
+    // Track all keys for custom movement (both fly and orbit cameras)
     scene.onKeyboardObservable.add((kbInfo) => {
-      if (editorStore.cameraMode !== 'fly') return
-      
       const key = kbInfo.event.key.toLowerCase()
       const isDown = kbInfo.type === KeyboardEventTypes.KEYDOWN
       
@@ -347,64 +339,115 @@ export function useBabylon() {
       }
     })
     
-    // Apply velocity-based movement each frame (fly camera only)
+    // Apply velocity-based movement each frame (both cameras)
     scene.onBeforeRenderObservable.add(() => {
-      if (editorStore.cameraMode !== 'fly' || !flyCamera || !flyCamera.rotationQuaternion) return
-      
-      const forward = Vector3.Forward().rotateByQuaternionToRef(flyCamera.rotationQuaternion, new Vector3())
-      const right = Vector3.Right().rotateByQuaternionToRef(flyCamera.rotationQuaternion, new Vector3())
-      const up = Vector3.Up().rotateByQuaternionToRef(flyCamera.rotationQuaternion, new Vector3())
-      
-      if (keysPressed.forward) {
-        cameraVelocity.forward = Math.min(cameraVelocity.forward + acceleration, maxSpeed)
-      } else if (keysPressed.backward) {
-        cameraVelocity.forward = Math.max(cameraVelocity.forward - acceleration, -maxSpeed)
-      }
-      
-      if (keysPressed.right) {
-        cameraVelocity.right = Math.min(cameraVelocity.right + acceleration, maxSpeed)
-      } else if (keysPressed.left) {
-        cameraVelocity.right = Math.max(cameraVelocity.right - acceleration, -maxSpeed)
-      }
-      
-      if (keysPressed.moveUp) {
-        cameraVelocity.up = Math.min(cameraVelocity.up + acceleration, maxSpeed)
-      } else if (keysPressed.moveDown) {
-        cameraVelocity.up = Math.max(cameraVelocity.up - acceleration, -maxSpeed)
-      }
-      
-      if (keysPressed.rollLeft) {
-        cameraVelocity.rollVel = Math.min(cameraVelocity.rollVel + rollAccel, maxRollSpeed)
-      } else if (keysPressed.rollRight) {
-        cameraVelocity.rollVel = Math.max(cameraVelocity.rollVel - rollAccel, -maxRollSpeed)
-      }
-      
-      if (Math.abs(cameraVelocity.forward) > 0.0001) {
-        flyCamera.position.addInPlace(forward.scale(cameraVelocity.forward))
-      }
-      if (Math.abs(cameraVelocity.right) > 0.0001) {
-        flyCamera.position.addInPlace(right.scale(cameraVelocity.right))
-      }
-      if (Math.abs(cameraVelocity.up) > 0.0001) {
-        flyCamera.position.addInPlace(up.scale(cameraVelocity.up))
-      }
-      
-      if (Math.abs(cameraVelocity.rollVel) > 0.0001) {
-        const rollRotation = Quaternion.RotationAxis(forward, cameraVelocity.rollVel)
-        flyCamera.rotationQuaternion = rollRotation.multiply(flyCamera.rotationQuaternion)
-      }
-      
-      if (!keysPressed.forward && !keysPressed.backward) {
-        cameraVelocity.forward *= damping
-      }
-      if (!keysPressed.left && !keysPressed.right) {
-        cameraVelocity.right *= damping
-      }
-      if (!keysPressed.moveUp && !keysPressed.moveDown) {
-        cameraVelocity.up *= damping
-      }
-      if (!keysPressed.rollLeft && !keysPressed.rollRight) {
-        cameraVelocity.rollVel *= rollDamping
+      if (editorStore.cameraMode === 'fly' && flyCamera && flyCamera.rotationQuaternion) {
+        // FLY CAMERA MODE - move camera position
+        const forward = Vector3.Forward().rotateByQuaternionToRef(flyCamera.rotationQuaternion, new Vector3())
+        const right = Vector3.Right().rotateByQuaternionToRef(flyCamera.rotationQuaternion, new Vector3())
+        const up = Vector3.Up().rotateByQuaternionToRef(flyCamera.rotationQuaternion, new Vector3())
+        
+        if (keysPressed.forward) {
+          cameraVelocity.forward = Math.min(cameraVelocity.forward + acceleration, maxSpeed)
+        } else if (keysPressed.backward) {
+          cameraVelocity.forward = Math.max(cameraVelocity.forward - acceleration, -maxSpeed)
+        }
+        
+        if (keysPressed.right) {
+          cameraVelocity.right = Math.min(cameraVelocity.right + acceleration, maxSpeed)
+        } else if (keysPressed.left) {
+          cameraVelocity.right = Math.max(cameraVelocity.right - acceleration, -maxSpeed)
+        }
+        
+        if (keysPressed.moveUp) {
+          cameraVelocity.up = Math.min(cameraVelocity.up + acceleration, maxSpeed)
+        } else if (keysPressed.moveDown) {
+          cameraVelocity.up = Math.max(cameraVelocity.up - acceleration, -maxSpeed)
+        }
+        
+        if (keysPressed.rollLeft) {
+          cameraVelocity.rollVel = Math.min(cameraVelocity.rollVel + rollAccel, maxRollSpeed)
+        } else if (keysPressed.rollRight) {
+          cameraVelocity.rollVel = Math.max(cameraVelocity.rollVel - rollAccel, -maxRollSpeed)
+        }
+        
+        if (Math.abs(cameraVelocity.forward) > 0.0001) {
+          flyCamera.position.addInPlace(forward.scale(cameraVelocity.forward))
+        }
+        if (Math.abs(cameraVelocity.right) > 0.0001) {
+          flyCamera.position.addInPlace(right.scale(cameraVelocity.right))
+        }
+        if (Math.abs(cameraVelocity.up) > 0.0001) {
+          flyCamera.position.addInPlace(up.scale(cameraVelocity.up))
+        }
+        
+        if (Math.abs(cameraVelocity.rollVel) > 0.0001) {
+          const rollRotation = Quaternion.RotationAxis(forward, cameraVelocity.rollVel)
+          flyCamera.rotationQuaternion = rollRotation.multiply(flyCamera.rotationQuaternion)
+        }
+        
+        if (!keysPressed.forward && !keysPressed.backward) {
+          cameraVelocity.forward *= damping
+        }
+        if (!keysPressed.left && !keysPressed.right) {
+          cameraVelocity.right *= damping
+        }
+        if (!keysPressed.moveUp && !keysPressed.moveDown) {
+          cameraVelocity.up *= damping
+        }
+        if (!keysPressed.rollLeft && !keysPressed.rollRight) {
+          cameraVelocity.rollVel *= rollDamping
+        }
+      } else if (editorStore.cameraMode === 'orbit' && orbitCamera) {
+        // ORBIT CAMERA MODE - move target (origin) in camera view direction
+        // Calculate view direction vectors from orbit camera
+        const cameraDirection = orbitCamera.position.subtract(orbitCamera.target).normalize()
+        const forward = cameraDirection.scale(-1) // Forward is opposite of camera direction
+        const right = Vector3.Cross(cameraDirection, Vector3.Up()).normalize()
+        const up = Vector3.Up()
+        
+        // Movement speed scaled by distance for more natural feel
+        const moveSpeed = Math.max(orbitCamera.radius * 0.05, 0.1)
+        
+        if (keysPressed.forward) {
+          cameraVelocity.forward = Math.min(cameraVelocity.forward + acceleration, maxSpeed)
+        } else if (keysPressed.backward) {
+          cameraVelocity.forward = Math.max(cameraVelocity.forward - acceleration, -maxSpeed)
+        }
+        
+        if (keysPressed.right) {
+          cameraVelocity.right = Math.min(cameraVelocity.right + acceleration, maxSpeed)
+        } else if (keysPressed.left) {
+          cameraVelocity.right = Math.max(cameraVelocity.right - acceleration, -maxSpeed)
+        }
+        
+        if (keysPressed.moveUp) {
+          cameraVelocity.up = Math.min(cameraVelocity.up + acceleration, maxSpeed)
+        } else if (keysPressed.moveDown) {
+          cameraVelocity.up = Math.max(cameraVelocity.up - acceleration, -maxSpeed)
+        }
+        
+        // Move target based on velocities
+        if (Math.abs(cameraVelocity.forward) > 0.0001) {
+          orbitCamera.target.addInPlace(forward.scale(cameraVelocity.forward * moveSpeed))
+        }
+        if (Math.abs(cameraVelocity.right) > 0.0001) {
+          orbitCamera.target.addInPlace(right.scale(cameraVelocity.right * moveSpeed))
+        }
+        if (Math.abs(cameraVelocity.up) > 0.0001) {
+          orbitCamera.target.addInPlace(up.scale(cameraVelocity.up * moveSpeed))
+        }
+        
+        // Apply damping
+        if (!keysPressed.forward && !keysPressed.backward) {
+          cameraVelocity.forward *= damping
+        }
+        if (!keysPressed.left && !keysPressed.right) {
+          cameraVelocity.right *= damping
+        }
+        if (!keysPressed.moveUp && !keysPressed.moveDown) {
+          cameraVelocity.up *= damping
+        }
       }
     })
 
@@ -452,8 +495,25 @@ export function useBabylon() {
     // Watch for file changes
     watch(() => appStore.currentFile, async (file, oldFile) => {
       if (file) {
-        // Pass isPreview flag to loadSplat
-        await loadSplat(file.url, file.name, file.isPreview)
+        // Check if this file is already loaded (same URL or splat already exists) to prevent duplicate loads
+        const isSameFile = oldFile && oldFile.url === file.url
+        
+        // Also check if we already have a splat loaded (for SQPZ imports that load directly)
+        const hasSplat = splats.size > 0 && editorStore.activeObjectId
+        
+        if (isSameFile) {
+          console.log('[Babylon] File already loaded (same URL), skipping duplicate load')
+          return
+        }
+        
+        if (hasSplat && file.skipFlipPrompt) {
+          // SQPZ import already loaded the splat directly - don't reload
+          console.log('[Babylon] Splat already loaded by SQPZ import, skipping watcher load')
+          return
+        }
+        
+        // Pass isPreview and skipFlipPrompt flags to loadSplat
+        await loadSplat(file.url, file.name, file.isPreview, false, undefined, file.skipFlipPrompt)
       } else {
         clearSplat()
       }
@@ -2075,11 +2135,54 @@ export function useBabylon() {
     const result = await bakeTransformToVertices()
     
     if (result) {
-      console.log('[Babylon] Auto Y-flip and bake completed successfully')
+      // Mark this splat as flipped so we can track it in SQPZ export
+      splatFlipStates.set(objectId, true)
+      console.log('[Babylon] Auto Y-flip and bake completed successfully - marked as flipped')
       // Re-focus camera after transform
       focusCamera()
     } else {
       console.error('[Babylon] Auto Y-flip and bake failed')
+    }
+
+    return result
+  }
+
+  /**
+   * Re-apply flip after internal reload (for operations like clip/delete)
+   * Called automatically after reloading a splat that was previously flipped
+   */
+  async function reapplyFlipAfterReload(objectId: string): Promise<boolean> {
+    const wasFlipped = splatFlipStates.get(objectId)
+    if (!wasFlipped) {
+      return true // Nothing to do
+    }
+
+    const mesh = splats.get(objectId)
+    if (!mesh) {
+      console.warn('[Babylon] Mesh not found for re-flip:', objectId)
+      return false
+    }
+
+    // Check if the mesh has the -Y scale from Babylon's loader
+    if (mesh.scaling.y >= 0) {
+      console.log('[Babylon] Mesh already has positive Y scale, skipping re-flip')
+      return true
+    }
+
+    console.log('[Babylon] Re-applying flip after reload for', objectId)
+
+    // Apply the same flip transform
+    mesh.scaling.y = 1
+    mesh.rotation.z = Math.PI
+    syncTransformToStore()
+
+    // Bake it again
+    const result = await bakeTransformToVertices()
+    
+    if (result) {
+      console.log('[Babylon] Re-flip and bake completed after reload')
+    } else {
+      console.error('[Babylon] Re-flip and bake failed after reload')
     }
 
     return result
@@ -3436,7 +3539,7 @@ export function useBabylon() {
   // Must match the ID used in sceneStore.addOrUpdatePreview()
   const PREVIEW_SPLAT_ID = 'preview'
 
-  async function loadSplat(url: string, name: string, isPreview: boolean = false, isInternalReload: boolean = false, existingId?: string): Promise<string | null> {
+  async function loadSplat(url: string, name: string, isPreview: boolean = false, isInternalReload: boolean = false, existingId?: string, skipFlipPrompt: boolean = false): Promise<string | null> {
     if (!scene) {
       console.error('[Babylon] Cannot load splat - scene not initialized')
       return null
@@ -3624,12 +3727,21 @@ export function useBabylon() {
       // Defensive cleanup: ensure no orphaned splat meshes remain in the scene
       cleanupOrphanedSplats()
       
-      // Prompt for Y-axis flip on user imports (not previews or internal reloads)
-      // Babylon's loader applies scaling.y = -1 for ALL GS formats (PLY, SPZ, SPLAT)
-      if (!isPreview && !isInternalReload) {
-        if (newSplat.scaling.y < 0) {
-          pendingYFlipObjectId.value = objectId
-          console.log('[Babylon] GS import detected with Y-flip — prompting user')
+      // Handle Y-axis flip
+      if (!isPreview) {
+        if (isInternalReload) {
+          // Internal reload after operation - check if this splat was previously flipped
+          // If so, automatically re-apply the flip and bake
+          await reapplyFlipAfterReload(objectId)
+        } else if (!skipFlipPrompt) {
+          // User import - prompt for Y-axis flip (unless skipFlipPrompt is true, e.g. SQPZ import)
+          // Babylon's loader applies scaling.y = -1 for ALL GS formats (PLY, SPZ, SPLAT)
+          if (newSplat.scaling.y < 0) {
+            pendingYFlipObjectId.value = objectId
+            console.log('[Babylon] GS import detected with Y-flip — prompting user')
+          }
+        } else {
+          console.log('[Babylon] Skipping Y-flip prompt (SQPZ import will handle flip state)')
         }
       }
       
@@ -3668,6 +3780,7 @@ export function useBabylon() {
     originalFileNames.delete(id)
     positionCaches.delete(id)
     splatCounts.delete(id)
+    splatFlipStates.delete(id)
     
     // Remove from scene store
     sceneStore.removeObject(id)
@@ -3704,6 +3817,7 @@ export function useBabylon() {
     originalFileNames.clear()
     positionCaches.clear()
     splatCounts.clear()
+    splatFlipStates.clear()
     
     // Clear stores
     sceneStore.clearAll()
@@ -4414,6 +4528,251 @@ export function useBabylon() {
     }
   }
 
+  // ============================================
+  // WAYPOINT SYSTEM
+  // ============================================
+
+  /**
+   * Create a 3D marker for a waypoint showing camera position and direction
+   */
+  function createWaypointMarker(
+    waypointId: string, 
+    alpha: number, 
+    beta: number, 
+    radius: number, 
+    target: Vector3, 
+    name: string
+  ): Mesh | null {
+    if (!scene) return null
+
+    // Calculate camera position from orbit parameters
+    const camX = target.x + radius * Math.sin(beta) * Math.cos(alpha)
+    const camY = target.y + radius * Math.cos(beta)
+    const camZ = target.z + radius * Math.sin(beta) * Math.sin(alpha)
+    const cameraPos = new Vector3(camX, camY, camZ)
+
+    // Create parent mesh to group all marker components
+    const markerParent = new Mesh(`waypoint_${waypointId}`, scene)
+    markerParent.position = cameraPos.clone()
+    
+    // Create sphere at camera position
+    const sphere = MeshBuilder.CreateSphere(`waypoint_sphere_${waypointId}`, {
+      diameter: 0.3,
+      segments: 12
+    }, scene)
+    sphere.parent = markerParent
+    sphere.position = Vector3.Zero()
+    
+    const sphereMaterial = new StandardMaterial(`waypoint_sphere_mat_${waypointId}`, scene)
+    sphereMaterial.diffuseColor = new Color3(0.2, 0.8, 1.0)  // Cyan
+    sphereMaterial.emissiveColor = new Color3(0.1, 0.4, 0.6)
+    sphereMaterial.alpha = 0.9
+    sphere.material = sphereMaterial
+    
+    // Create small sphere at target/focus point
+    const targetSphere = MeshBuilder.CreateSphere(`waypoint_target_${waypointId}`, {
+      diameter: 0.15,
+      segments: 8
+    }, scene)
+    targetSphere.position = target.clone()
+    
+    const targetMaterial = new StandardMaterial(`waypoint_target_mat_${waypointId}`, scene)
+    targetMaterial.diffuseColor = new Color3(1.0, 0.6, 0.2)  // Orange
+    targetMaterial.emissiveColor = new Color3(0.5, 0.3, 0.1)
+    targetMaterial.alpha = 0.8
+    targetSphere.material = targetMaterial
+    targetSphere.isPickable = false
+    
+    // Create line connecting camera to target focus point
+    const connectionLine = MeshBuilder.CreateLines(`waypoint_line_${waypointId}`, {
+      points: [Vector3.Zero(), target.subtract(cameraPos)]
+    }, scene)
+    connectionLine.color = new Color3(0.5, 0.7, 1.0)
+    connectionLine.alpha = 0.6
+    connectionLine.parent = markerParent
+    connectionLine.isPickable = false
+    
+    // Create camera frustum lines
+    const direction = target.subtract(cameraPos).normalize()
+    const frustumDepth = radius * 0.15  // Small frustum relative to camera distance
+    const frustumSize = frustumDepth * 0.5
+    
+    // Calculate right and up vectors for the camera
+    const up = new Vector3(0, 1, 0)
+    const right = Vector3.Cross(direction, up).normalize()
+    const actualUp = Vector3.Cross(right, direction).normalize()
+    
+    // Calculate frustum corners
+    const frustumCenter = cameraPos.add(direction.scale(frustumDepth))
+    const corners = [
+      frustumCenter.add(right.scale(-frustumSize)).add(actualUp.scale(-frustumSize)),  // Bottom-left
+      frustumCenter.add(right.scale(frustumSize)).add(actualUp.scale(-frustumSize)),   // Bottom-right
+      frustumCenter.add(right.scale(frustumSize)).add(actualUp.scale(frustumSize)),    // Top-right
+      frustumCenter.add(right.scale(-frustumSize)).add(actualUp.scale(frustumSize))    // Top-left
+    ]
+    
+    // Create frustum wireframe
+    const frustumLines = [
+      [Vector3.Zero(), corners[0].subtract(cameraPos)],
+      [Vector3.Zero(), corners[1].subtract(cameraPos)],
+      [Vector3.Zero(), corners[2].subtract(cameraPos)],
+      [Vector3.Zero(), corners[3].subtract(cameraPos)],
+      [corners[0].subtract(cameraPos), corners[1].subtract(cameraPos)],
+      [corners[1].subtract(cameraPos), corners[2].subtract(cameraPos)],
+      [corners[2].subtract(cameraPos), corners[3].subtract(cameraPos)],
+      [corners[3].subtract(cameraPos), corners[0].subtract(cameraPos)]
+    ]
+    
+    const frustum = MeshBuilder.CreateLineSystem(`waypoint_frustum_${waypointId}`, {
+      lines: frustumLines
+    }, scene)
+    frustum.color = new Color3(0.2, 0.8, 1.0)
+    frustum.parent = markerParent
+    
+    // Make the parent pickable
+    markerParent.isPickable = true
+    sphere.isPickable = false
+    frustum.isPickable = false
+    
+    // Store references
+    waypointMarkers.set(waypointId, markerParent)
+    waypointTargetSpheres.set(waypointId, targetSphere)
+    markerParent.setEnabled(waypointMarkersVisible)
+    targetSphere.setEnabled(waypointMarkersVisible)
+    
+    console.log('[Babylon] Created waypoint marker:', name, 'at', cameraPos, 'looking at', target)
+    return markerParent
+  }
+
+  /**
+   * Remove waypoint marker
+   */
+  function removeWaypointMarker(waypointId: string) {
+    const marker = waypointMarkers.get(waypointId)
+    if (marker) {
+      marker.dispose()
+      waypointMarkers.delete(waypointId)
+    }
+    
+    const targetSphere = waypointTargetSpheres.get(waypointId)
+    if (targetSphere) {
+      targetSphere.dispose()
+      waypointTargetSpheres.delete(waypointId)
+    }
+    
+    console.log('[Babylon] Removed waypoint marker:', waypointId)
+  }
+
+  /**
+   * Update waypoint marker position
+   */
+  function updateWaypointMarkerPosition(waypointId: string, position: Vector3) {
+    const marker = waypointMarkers.get(waypointId)
+    if (marker) {
+      marker.position = position.clone()
+    }
+  }
+
+  /**
+   * Clear all waypoint markers
+   */
+  function clearWaypointMarkers() {
+    waypointMarkers.forEach(marker => marker.dispose())
+    waypointMarkers.clear()
+    waypointTargetSpheres.forEach(sphere => sphere.dispose())
+    waypointTargetSpheres.clear()
+    console.log('[Babylon] Cleared all waypoint markers')
+  }
+
+  /**
+   * Set waypoint markers visibility
+   */
+  function setWaypointMarkersVisible(visible: boolean) {
+    waypointMarkersVisible = visible
+    waypointMarkers.forEach(marker => marker.setEnabled(visible))
+    waypointTargetSpheres.forEach(sphere => sphere.setEnabled(visible))
+  }
+
+  /**
+   * Resize engine (call when canvas size changes)
+   */
+  function resizeEngine() {
+    if (engine) {
+      engine.resize()
+      console.log('[Babylon] Engine resized')
+    }
+  }
+
+  /**
+   * Animate camera to waypoint smoothly
+   */
+  function animateCameraToWaypoint(
+    alpha: number,
+    beta: number,
+    radius: number,
+    target: Vector3,
+    duration: number = 1000
+  ): Promise<void> {
+    return new Promise((resolve) => {
+      if (!scene || !orbitCamera) {
+        resolve()
+        return
+      }
+
+      // Force orbit camera to be active for waypoint navigation
+      if (activeCamera !== orbitCamera) {
+        scene.activeCamera = orbitCamera
+        activeCamera = orbitCamera
+      }
+
+      const startAlpha = orbitCamera.alpha
+      const startBeta = orbitCamera.beta
+      const startRadius = orbitCamera.radius
+      const startTarget = orbitCamera.target.clone()
+
+      const startTime = Date.now()
+
+      const animate = () => {
+        const elapsed = Date.now() - startTime
+        const t = Math.min(elapsed / duration, 1)
+        
+        // Easing function (ease-in-out)
+        const ease = t < 0.5 
+          ? 2 * t * t 
+          : -1 + (4 - 2 * t) * t
+
+        // Interpolate camera parameters
+        orbitCamera.alpha = startAlpha + (alpha - startAlpha) * ease
+        orbitCamera.beta = startBeta + (beta - startBeta) * ease
+        orbitCamera.radius = startRadius + (radius - startRadius) * ease
+        orbitCamera.target = Vector3.Lerp(startTarget, target, ease)
+
+        if (t < 1) {
+          requestAnimationFrame(animate)
+        } else {
+          console.log('[Babylon] Camera animation complete')
+          resolve()
+        }
+      }
+
+      animate()
+    })
+  }
+
+  /**
+   * Get current camera state for creating waypoints
+   */
+  function getCurrentCameraState(): { alpha: number; beta: number; radius: number; target: Vector3 } | null {
+    if (!orbitCamera) return null
+    
+    return {
+      alpha: orbitCamera.alpha,
+      beta: orbitCamera.beta,
+      radius: orbitCamera.radius,
+      target: orbitCamera.target.clone()
+    }
+  }
+
   /**
    * Decode a base64 PNG mask into a Uint8Array
    */
@@ -4445,6 +4804,35 @@ export function useBabylon() {
       img.onerror = () => resolve(null)
       img.src = base64.startsWith('data:') ? base64 : `data:image/png;base64,${base64}`
     })
+  }
+
+  // ============================================
+  // FLIP STATE TRACKING
+  // ============================================
+
+  /**
+   * Get whether a splat was Y-flipped
+   */
+  function getSplatFlipState(id: string): boolean {
+    return splatFlipStates.get(id) || false
+  }
+
+  /**
+   * Set flip state for a splat (used when importing from SQPZ)
+   */
+  function setSplatFlipState(id: string, wasFlipped: boolean) {
+    if (wasFlipped) {
+      splatFlipStates.set(id, true)
+    } else {
+      splatFlipStates.delete(id)
+    }
+  }
+
+  /**
+   * Get all splat IDs and their flip states
+   */
+  function getAllSplatFlipStates(): Map<string, boolean> {
+    return new Map(splatFlipStates)
   }
 
   return {
@@ -4524,6 +4912,20 @@ export function useBabylon() {
     captureMultiViewImages,
     projectMasksToSplatIndices,
     // View cube (camera orientation gizmo)
-    setViewCubeVisible
+    setViewCubeVisible,
+    // Waypoint system
+    createWaypointMarker,
+    removeWaypointMarker,
+    updateWaypointMarkerPosition,
+    clearWaypointMarkers,
+    setWaypointMarkersVisible,
+    animateCameraToWaypoint,
+    getCurrentCameraState,
+    resizeEngine,
+    // Flip state tracking
+    getSplatFlipState,
+    setSplatFlipState,
+    getAllSplatFlipStates,
+    reapplyFlipAfterReload
   }
 }

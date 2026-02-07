@@ -178,53 +178,6 @@ function handleClipSphereRadiusChange(value: string | number) {
     </div>
     
     <div class="quantum-panel-content">
-      <!-- View Helpers Section -->
-      <div class="section">
-        <div class="section-title">View Helpers</div>
-        
-        <div class="toggle-row">
-          <v-switch
-            :model-value="editor.showAxes.value"
-            @update:model-value="editor.toggleAxes"
-            density="compact"
-            hide-details
-            color="primary"
-          />
-          <div class="toggle-label">
-            <v-icon size="small" class="mr-2">mdi-axis-arrow</v-icon>
-            Show Axes
-          </div>
-        </div>
-        
-        <div class="toggle-row">
-          <v-switch
-            :model-value="editor.showGroundPlane.value"
-            @update:model-value="editor.toggleGroundPlane"
-            density="compact"
-            hide-details
-            color="primary"
-          />
-          <div class="toggle-label">
-            <v-icon size="small" class="mr-2">mdi-grid</v-icon>
-            Ground Plane
-          </div>
-        </div>
-        
-        <div v-if="editor.showGroundPlane.value" class="slider-row">
-          <span class="slider-label">Size</span>
-          <v-slider
-            :model-value="editor.groundPlaneSize.value"
-            @update:model-value="editor.setGroundPlaneSize"
-            :min="5"
-            :max="50"
-            :step="5"
-            hide-details
-            density="compact"
-            thumb-label
-          />
-        </div>
-      </div>
-      
       <!-- Orientation Section -->
       <div class="section">
         <div class="section-title">Orientation</div>

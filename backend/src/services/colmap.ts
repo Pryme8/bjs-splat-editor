@@ -205,7 +205,7 @@ async function runColmapMapper(
   // Check if reconstruction succeeded
   const sparseModels = await fs.readdir(sparseDir)
   if (sparseModels.length === 0) {
-    throw new Error('COLMAP reconstruction failed - no models created. Try with more images or better coverage.')
+    throw new Error('COLMAP reconstruction failed - no models created. This usually means COLMAP could not find a good initial image pair. Try with more overlapping images or better scene coverage.')
   }
 
   // Use the first (usually best) model
@@ -287,10 +287,16 @@ async function runColmap(
       registerProcess(jobId, proc)
     }
 
+    // Capture ALL output for error reporting
+    const outputLines: string[] = []
+    const errorLines: string[] = []
+
     proc.stdout.on('data', (data) => {
       const lines = data.toString().split('\n')
       for (const line of lines) {
         if (line.trim()) {
+          outputLines.push(line)
+          console.log(`[COLMAP ${command}]`, line)
           onOutput?.(line)
         }
       }
@@ -300,6 +306,8 @@ async function runColmap(
       const lines = data.toString().split('\n')
       for (const line of lines) {
         if (line.trim()) {
+          errorLines.push(line)
+          console.error(`[COLMAP ${command} ERROR]`, line)
           onOutput?.(line)
         }
       }
@@ -309,7 +317,10 @@ async function runColmap(
       if (code === 0) {
         resolve()
       } else {
-        reject(new Error(`COLMAP ${command} failed with code ${code}`))
+        // Include captured output in error message
+        const lastErrors = errorLines.slice(-10).join('\n') || outputLines.slice(-10).join('\n')
+        const errorMsg = `COLMAP ${command} failed with code ${code}${lastErrors ? `\n\nLast output:\n${lastErrors}` : ''}`
+        reject(new Error(errorMsg))
       }
     })
 
@@ -392,6 +403,12 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
         if (result.device_type && result.device_name) {
           console.log(`[COLMAP] Device: ${result.device_name} (${result.device_type.toUpperCase()})`)
         }
+        if (result.exif_count && result.exif_count > 0) {
+          console.log(`[COLMAP] Camera: ${result.camera_make} ${result.camera_model} (${result.exif_count} images with EXIF)`)
+          if (result.focal_mm && result.focal_pixels) {
+            console.log(`[COLMAP] Focal length: ${result.focal_mm.toFixed(1)}mm (${result.focal_pixels.toFixed(0)}px from EXIF)`)
+          }
+        }
         
         onProgress({
           status: 'learned_features',
@@ -425,6 +442,15 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
           message: `DISK+LightGlue failed: ${errMsg.slice(0, 100)} - falling back to SIFT`,
           progress: 10
         })
+        
+        // Delete the database before SIFT fallback to avoid constraint errors
+        try {
+          await fs.unlink(databasePath)
+          console.log('[COLMAP] Deleted database for SIFT fallback')
+        } catch (unlinkErr) {
+          console.warn('[COLMAP] Could not delete database:', unlinkErr)
+        }
+        
         // Fall through to SIFT extraction
       }
     }

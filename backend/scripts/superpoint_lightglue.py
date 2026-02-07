@@ -22,10 +22,104 @@ import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
+from PIL import Image
+from PIL.ExifTags import TAGS
 
 # Suppress warnings
 import warnings
 warnings.filterwarnings("ignore")
+
+
+def extract_camera_params_from_exif(image_path: Path) -> dict:
+    """
+    Extract camera parameters from EXIF metadata
+    
+    Returns dict with:
+        focal_pixels: focal length in pixels (if calculable)
+        focal_mm: focal length in mm
+        sensor_width_mm: sensor width estimate
+        make: camera manufacturer
+        model: camera model
+        width: image width
+        height: image height
+    """
+    result = {
+        'focal_pixels': None,
+        'focal_mm': None,
+        'sensor_width_mm': None,
+        'make': None,
+        'model': None,
+        'width': None,
+        'height': None
+    }
+    
+    try:
+        with Image.open(image_path) as img:
+            result['width'] = img.width
+            result['height'] = img.height
+            
+            exif = img.getexif()
+            if not exif:
+                return result
+            
+            # Extract readable EXIF data
+            exif_data = {}
+            for tag_id, value in exif.items():
+                tag = TAGS.get(tag_id, tag_id)
+                exif_data[tag] = value
+            
+            # Get basic info
+            result['make'] = exif_data.get('Make', '').strip()
+            result['model'] = exif_data.get('Model', '').strip()
+            
+            # Get focal length
+            focal_length = exif_data.get('FocalLength')
+            if focal_length:
+                if isinstance(focal_length, tuple):
+                    result['focal_mm'] = focal_length[0] / focal_length[1]
+                else:
+                    result['focal_mm'] = float(focal_length)
+            
+            # Get 35mm equivalent focal length (useful for sensor size estimation)
+            focal_35mm = exif_data.get('FocalLengthIn35mmFilm')
+            
+            # Estimate sensor width
+            if result['focal_mm'] and focal_35mm:
+                # Calculate sensor width from crop factor
+                # crop_factor = focal_35mm / focal_mm
+                # sensor_width = 36mm / crop_factor
+                crop_factor = focal_35mm / result['focal_mm']
+                result['sensor_width_mm'] = 36.0 / crop_factor
+            else:
+                # Common sensor sizes based on camera make/model
+                make_lower = result['make'].lower() if result['make'] else ''
+                model_lower = result['model'].lower() if result['model'] else ''
+                
+                if 'iphone' in model_lower or 'pixel' in model_lower or 'galaxy' in model_lower:
+                    result['sensor_width_mm'] = 6.0  # Typical smartphone sensor
+                elif 'canon' in make_lower or 'nikon' in make_lower:
+                    if 'eos r' in model_lower or 'd850' in model_lower or 'z' in model_lower:
+                        result['sensor_width_mm'] = 36.0  # Full frame
+                    else:
+                        result['sensor_width_mm'] = 22.3  # APS-C
+                elif 'sony' in make_lower:
+                    if 'a7' in model_lower or 'a9' in model_lower:
+                        result['sensor_width_mm'] = 36.0  # Full frame
+                    else:
+                        result['sensor_width_mm'] = 23.5  # APS-C
+                elif 'olympus' in make_lower or 'panasonic' in make_lower:
+                    result['sensor_width_mm'] = 17.3  # Micro 4/3
+                else:
+                    result['sensor_width_mm'] = 23.6  # Default to APS-C
+            
+            # Calculate focal length in pixels
+            if result['focal_mm'] and result['sensor_width_mm'] and result['width']:
+                result['focal_pixels'] = (result['focal_mm'] / result['sensor_width_mm']) * result['width']
+                
+    except Exception as e:
+        print(f"Warning: Could not extract EXIF from {image_path.name}: {e}", file=sys.stderr)
+    
+    return result
 
 
 def get_device(force_cpu: bool = False):
@@ -306,16 +400,29 @@ def image_ids_to_pair_id(image_id1: int, image_id2: int) -> int:
     return image_id1 * 2147483647 + image_id2
 
 
-def add_camera(cursor: sqlite3.Cursor, camera_id: int, width: int, height: int):
-    """Add a simple pinhole camera to the database (caller manages transaction)"""
-    # SIMPLE_PINHOLE model (model_id=0): f, cx, cy
-    focal = max(width, height) * 1.2  # Initial focal length estimate
+def add_camera(cursor: sqlite3.Cursor, camera_id: int, width: int, height: int, focal_pixels: float = None):
+    """Add a simple radial camera to the database (caller manages transaction)"""
+    # SIMPLE_RADIAL model (model_id=1): f, cx, cy, k1
+    # Match COLMAP's default camera model for consistency
+    
+    if focal_pixels:
+        # Use EXIF-derived focal length
+        focal = focal_pixels
+    else:
+        # Fallback: estimate assuming ~55-60° horizontal FOV (typical for smartphone/camera)
+        # For 4K (3840x2160): focal ≈ 3840 / (2 * tan(55°/2)) ≈ 3200 pixels
+        # Using diagonal as reference to handle both landscape and portrait
+        diagonal = np.sqrt(width**2 + height**2)
+        focal = diagonal * 0.85  # Approximately 55° diagonal FOV
+    
+    # Principal point at image center
     cx, cy = width * 0.5, height * 0.5
-    params = np.array([focal, cx, cy], dtype=np.float64)
+    k1 = 0.0  # Initial radial distortion (will be refined by COLMAP)
+    params = np.array([focal, cx, cy, k1], dtype=np.float64)
     
     cursor.execute(
         'INSERT OR REPLACE INTO cameras VALUES (?, ?, ?, ?, ?, ?)',
-        (camera_id, 0, width, height, params.tobytes(), 1)
+        (camera_id, 1, width, height, params.tobytes(), 1)
     )
 
 
@@ -567,11 +674,22 @@ def process_images(
     print("Extracting features...", file=sys.stderr)
     all_np_features = {}   # numpy arrays for DB and verification
     all_gpu_features = {}  # GPU tensors for matching (avoid per-pair transfers)
+    exif_count = 0  # Track how many images have EXIF data
     
     # Single transaction for all feature inserts
     conn.execute('BEGIN')
     for i, image_path in enumerate(tqdm(images, desc="Features", file=sys.stderr)):
         image_id = i + 1
+        
+        # Extract EXIF metadata for camera parameters
+        exif_params = extract_camera_params_from_exif(image_path)
+        if exif_params['focal_pixels']:
+            exif_count += 1
+            if i == 0:  # Log first image info
+                print(f"EXIF detected: {exif_params['make']} {exif_params['model']}, " 
+                      f"focal={exif_params['focal_mm']:.1f}mm, "
+                      f"sensor={exif_params['sensor_width_mm']:.1f}mm, "
+                      f"focal_px={exif_params['focal_pixels']:.0f}px", file=sys.stderr)
         
         np_feat, gpu_feat = extract_features(disk, image_path, device, max_image_size, max_keypoints)
         all_np_features[image_id] = np_feat
@@ -579,11 +697,16 @@ def process_images(
         
         # Add to database (no per-row commits)
         width, height = np_feat['image_size']
-        add_camera(cursor, image_id, width, height)
+        add_camera(cursor, image_id, width, height, exif_params['focal_pixels'])
         add_image(cursor, image_id, image_path.name, image_id)
         add_keypoints(cursor, image_id, np_feat['keypoints'])
         add_descriptors(cursor, image_id, np_feat['descriptors'])
     conn.commit()
+    
+    if exif_count > 0:
+        print(f"Using EXIF camera data from {exif_count}/{len(images)} images", file=sys.stderr)
+    else:
+        print(f"No EXIF data found, using estimated focal lengths", file=sys.stderr)
     
     # Generate pairs based on strategy
     n_images = len(images)
@@ -644,6 +767,9 @@ def process_images(
     avg_matches = total_matches / max(pair_count, 1)
     avg_inliers = total_inliers / max(verified_pairs, 1) if not skip_verification else 0
     
+    # Get first image EXIF for summary (if available)
+    first_exif = extract_camera_params_from_exif(images[0])
+    
     summary = {
         "images": len(images),
         "match_strategy": match_strategy,
@@ -657,7 +783,12 @@ def process_images(
         "avg_matches_per_pair": float(avg_matches),
         "database": str(output_db),
         "device_type": "gpu" if device.type in ['cuda', 'mps'] else "cpu",
-        "device_name": torch.cuda.get_device_name(0) if device.type == 'cuda' else device.type.upper()
+        "device_name": torch.cuda.get_device_name(0) if device.type == 'cuda' else device.type.upper(),
+        "exif_count": exif_count,
+        "camera_make": first_exif.get('make'),
+        "camera_model": first_exif.get('model'),
+        "focal_mm": first_exif.get('focal_mm'),
+        "focal_pixels": first_exif.get('focal_pixels')
     }
     
     return summary
@@ -752,6 +883,10 @@ def main():
             print(json.dumps(summary))
         else:
             print(f"\nProcessed {summary['images']} images", file=sys.stderr)
+            if summary['exif_count'] > 0:
+                print(f"Camera: {summary['camera_make']} {summary['camera_model']} ({summary['exif_count']} images with EXIF)", file=sys.stderr)
+                if summary['focal_mm'] and summary['focal_pixels']:
+                    print(f"Focal length: {summary['focal_mm']:.1f}mm ({summary['focal_pixels']:.0f}px)", file=sys.stderr)
             print(f"Strategy: {summary['match_strategy']}, {summary['total_pairs']} pairs generated", file=sys.stderr)
             print(f"Matched {summary['pairs_matched']} pairs with {summary['total_matches']} total matches", file=sys.stderr)
             print(f"Avg keypoints: {summary['avg_keypoints_per_image']:.0f}, Avg matches: {summary['avg_matches_per_pair']:.0f}", file=sys.stderr)

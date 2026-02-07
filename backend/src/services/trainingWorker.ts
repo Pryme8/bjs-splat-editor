@@ -95,6 +95,23 @@ interface TrainingJobData {
 type ProgressCallback = (progress: JobProgress) => void
 
 /**
+ * Format elapsed time as human readable string
+ */
+function formatElapsedTime(ms: number): string {
+  const seconds = Math.floor(ms * 0.001)
+  const minutes = Math.floor(seconds / 60)
+  const hours = Math.floor(minutes / 60)
+  
+  if (hours > 0) {
+    return `${hours}h ${minutes % 60}m ${seconds % 60}s`
+  } else if (minutes > 0) {
+    return `${minutes}m ${seconds % 60}s`
+  } else {
+    return `${seconds}s`
+  }
+}
+
+/**
  * Process a training job through the full pipeline
  */
 export async function processTrainingJob(
@@ -103,6 +120,20 @@ export async function processTrainingJob(
 ): Promise<TrainingResult> {
   const { jobId, imagesDir, outputDir, config } = data
   const startTime = Date.now()
+  
+  // Phase timing
+  const phaseStartTimes: Record<string, number> = {}
+  const phaseDurations: Record<string, number> = {}
+  
+  const startPhase = (phaseName: string) => {
+    phaseStartTimes[phaseName] = Date.now()
+  }
+  
+  const endPhase = (phaseName: string) => {
+    if (phaseStartTimes[phaseName]) {
+      phaseDurations[phaseName] = Date.now() - phaseStartTimes[phaseName]
+    }
+  }
 
   try {
     // Report starting
@@ -110,7 +141,7 @@ export async function processTrainingJob(
       jobId,
       status: 'preprocessing',
       progress: 0,
-      message: 'Starting processing pipeline...',
+      message: 'Starting processing pipeline... [0s]',
       deviceType: 'cpu',
       deviceName: 'CPU'
     })
@@ -213,6 +244,7 @@ export async function processTrainingJob(
     console.log(`[TrainingWorker] Depth AI config: enabled=${config.depthEstimationEnabled}, model=${config.depthModelSize}, filter=${config.depthFloaterFilterEnabled}`)
     
     if (config.depthEstimationEnabled) {
+      startPhase('depth_estimation')
       const depthAvailable = await checkDepthEstimationAvailable()
       
       if (depthAvailable) {
@@ -275,15 +307,18 @@ export async function processTrainingJob(
           
           console.log(`[TrainingWorker] Depth estimation complete: ${depthSummary.successful}/${depthSummary.total_images} images`)
           
+          endPhase('depth_estimation')
+          
           onProgress({
             jobId,
             status: 'depth_estimation',
             progress: 14,
-            message: `Depth maps generated for ${depthSummary.successful} images`,
+            message: `Depth maps generated for ${depthSummary.successful} images [${formatElapsedTime(Date.now() - startTime)}]`,
             deviceType: depthDeviceType || 'cpu',
             deviceName: depthDeviceName || 'CPU'
           })
         } catch (depthError) {
+          endPhase('depth_estimation')
           console.warn(`[TrainingWorker] Depth estimation failed, continuing without:`, depthError)
           onProgress({
             jobId,
@@ -308,11 +343,13 @@ export async function processTrainingJob(
     }
 
     // Run COLMAP SfM pipeline
+    startPhase('colmap')
+    
     onProgress({
       jobId,
       status: 'sfm_features',
       progress: 15,
-      message: 'Running Structure from Motion (COLMAP)...',
+      message: `Running Structure from Motion (COLMAP)... [${formatElapsedTime(Date.now() - startTime)}]`,
       deviceType: 'cpu',  // COLMAP runs on CPU
       deviceName: 'CPU'
     })
@@ -344,14 +381,18 @@ export async function processTrainingJob(
       }
     })
 
+    endPhase('colmap')
+    
     // Save COLMAP result to job
     await updateJob(jobId, { colmapData: colmapResult })
+
+    console.log(`[TrainingWorker] ⏱️ COLMAP completed in ${formatElapsedTime(phaseDurations.colmap || 0)}`)
 
     onProgress({
       jobId,
       status: 'training_init',
       progress: 75,
-      message: `SfM complete: ${colmapResult.cameras.length} cameras, ${colmapResult.points3DCount} points`,
+      message: `SfM complete: ${colmapResult.cameras.length} cameras, ${colmapResult.points3DCount} points [${formatElapsedTime(Date.now() - startTime)}]`,
       colmapPreviewReady: true,  // Signal frontend to fetch and display COLMAP preview
       deviceType: 'cpu',
       deviceName: 'CPU'
@@ -378,7 +419,7 @@ export async function processTrainingJob(
     
     const engineLabel = resolvedEngine === 'gsplat' ? 'gsplat (Python/PyTorch)' : 
                         isDockerMode() ? 'OpenSplat (Docker GPU)' : `OpenSplat (${modeLabel})`
-    let initMessage = `Starting ${engineLabel} training...`
+    let initMessage = `Starting ${engineLabel} training... [${formatElapsedTime(Date.now() - startTime)}]`
     
     onProgress({
       jobId,
@@ -389,6 +430,8 @@ export async function processTrainingJob(
       deviceName: trainingDeviceName
     })
 
+    startPhase('training')
+    
     // Run training with the resolved engine
     const trainProgressCallback = (partial: Partial<JobProgress>) => {
       onProgress({
@@ -426,6 +469,9 @@ export async function processTrainingJob(
         onProgress: trainProgressCallback
       })
     }
+    
+    endPhase('training')
+    console.log(`[TrainingWorker] ⏱️ Training completed in ${formatElapsedTime(phaseDurations.training || 0)}`)
 
     // Post-processing: Depth-based floater filtering (if depth maps available)
     let finalSplatCount = result.splatCount
@@ -562,7 +608,35 @@ export async function processTrainingJob(
       deviceName: 'CPU'
     })
 
-    const trainingTime = (Date.now() - startTime) * 0.001
+    const totalTime = Date.now() - startTime
+    const trainingTime = totalTime * 0.001
+
+    // Build timing breakdown
+    const timingParts: string[] = []
+    if (phaseDurations.depth_estimation) {
+      timingParts.push(`Depth: ${formatElapsedTime(phaseDurations.depth_estimation)}`)
+    }
+    if (phaseDurations.colmap) {
+      timingParts.push(`COLMAP: ${formatElapsedTime(phaseDurations.colmap)}`)
+    }
+    if (phaseDurations.training) {
+      timingParts.push(`Training: ${formatElapsedTime(phaseDurations.training)}`)
+    }
+    
+    const timingBreakdown = timingParts.length > 0 ? ` (${timingParts.join(', ')})` : ''
+
+    console.log(`[TrainingWorker] ⏱️ ========================================`)
+    console.log(`[TrainingWorker] ⏱️ TOTAL TIME: ${formatElapsedTime(totalTime)}`)
+    if (phaseDurations.depth_estimation) {
+      console.log(`[TrainingWorker] ⏱️   - Depth Estimation: ${formatElapsedTime(phaseDurations.depth_estimation)}`)
+    }
+    if (phaseDurations.colmap) {
+      console.log(`[TrainingWorker] ⏱️   - COLMAP: ${formatElapsedTime(phaseDurations.colmap)}`)
+    }
+    if (phaseDurations.training) {
+      console.log(`[TrainingWorker] ⏱️   - Training: ${formatElapsedTime(phaseDurations.training)}`)
+    }
+    console.log(`[TrainingWorker] ⏱️ ========================================`)
 
     // Mark job complete
     const resultUrl = `/results/${jobId}/result.ply`
@@ -572,7 +646,7 @@ export async function processTrainingJob(
       jobId,
       status: 'complete',
       progress: 100,
-      message: `Training complete! ${finalSplatCount.toLocaleString()} splats generated in ${Math.round(trainingTime)}s`,
+      message: `✅ Complete! ${finalSplatCount.toLocaleString()} splats in ${formatElapsedTime(totalTime)}${timingBreakdown}`,
       splatCount: finalSplatCount,
       deviceType: 'cpu',
       deviceName: 'CPU'

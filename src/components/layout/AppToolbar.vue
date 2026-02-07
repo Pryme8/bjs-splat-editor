@@ -3,6 +3,8 @@ import { ref } from 'vue'
 import { useAppStore } from '@/stores/appStore'
 import { useSplatEditor } from '@/composables/useSplatEditor'
 import { useBabylon } from '@/composables/useBabylon'
+import { useSqpzExport } from '@/composables/useSqpzExport'
+import { useSqpzImport } from '@/composables/useSqpzImport'
 
 const emit = defineEmits<{
   toggleSidebar: []
@@ -13,7 +15,10 @@ const emit = defineEmits<{
 const appStore = useAppStore()
 const editor = useSplatEditor()
 const babylon = useBabylon()
+const sqpzExport = useSqpzExport()
+const sqpzImport = useSqpzImport()
 const showExportMenu = ref(false)
+const showSqpzExportMenu = ref(false)
 
 function handleFileImport() {
   const input = document.createElement('input')
@@ -23,6 +28,24 @@ function handleFileImport() {
     const file = (e.target as HTMLInputElement).files?.[0]
     if (file) {
       appStore.loadFile(file)
+    }
+  }
+  input.click()
+}
+
+function handleSqpzImport() {
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.accept = '.sqpz'
+  input.onchange = async (e) => {
+    const file = (e.target as HTMLInputElement).files?.[0]
+    if (file) {
+      const success = await sqpzImport.importWorkspace(file)
+      if (success) {
+        console.log('[Toolbar] SQPZ imported successfully')
+      } else {
+        console.error('[Toolbar] SQPZ import failed')
+      }
     }
   }
   input.click()
@@ -52,6 +75,50 @@ function handleExport(format: 'ply' | 'splat') {
   URL.revokeObjectURL(url)
   
   showExportMenu.value = false
+}
+
+async function handleSqpzExport(developmentMode: boolean) {
+  const projectName = appStore.currentFile?.name.replace(/\.[^/.]+$/, '') || 'project'
+  const success = await sqpzExport.exportAndDownload({
+    developmentMode,
+    projectName
+  })
+  
+  if (success) {
+    console.log('[Toolbar] SQPZ exported successfully')
+  } else {
+    console.error('[Toolbar] SQPZ export failed')
+  }
+  
+  showSqpzExportMenu.value = false
+}
+
+async function toggleViewerMode() {
+  if (!appStore.viewerMode) {
+    // Entering viewer mode - export current state to SQPZ
+    console.log('[Toolbar] Exporting workspace for viewer mode')
+    const result = await sqpzExport.exportWorkspace({
+      developmentMode: false,
+      projectName: appStore.currentFile?.name.replace(/\.[^/.]+$/, '') || 'preview'
+    })
+    
+    if (result) {
+      console.log('[Toolbar] Export successful:', {
+        splats: result.file.splats.length,
+        waypoints: result.file.waypoints.length,
+        buffers: result.buffers.length
+      })
+      appStore.setCurrentSqpzData(result.file, result.buffers)
+      appStore.setViewerMode(true)
+    } else {
+      console.error('[Toolbar] Export failed, cannot enter viewer mode')
+    }
+  } else {
+    // Exiting viewer mode
+    console.log('[Toolbar] Exiting viewer mode')
+    appStore.setViewerMode(false)
+    appStore.setCurrentSqpzData(null, [])
+  }
 }
 </script>
 
@@ -83,6 +150,13 @@ function handleExport(format: 'ply' | 'splat') {
         Import
       </v-btn>
       
+      <v-btn 
+        prepend-icon="mdi-folder-open"
+        @click="handleSqpzImport"
+      >
+        Import SQPZ
+      </v-btn>
+      
       <v-menu v-model="showExportMenu" :close-on-content-click="false">
         <template #activator="{ props }">
           <v-btn 
@@ -106,7 +180,46 @@ function handleExport(format: 'ply' | 'splat') {
           />
         </v-list>
       </v-menu>
+      
+      <v-menu v-model="showSqpzExportMenu" :close-on-content-click="false">
+        <template #activator="{ props }">
+          <v-btn 
+            prepend-icon="mdi-package-variant"
+            :disabled="!appStore.hasScene"
+            v-bind="props"
+          >
+            Export SQPZ
+          </v-btn>
+        </template>
+        <v-list density="compact">
+          <v-list-item 
+            prepend-icon="mdi-wrench" 
+            title="Development Mode"
+            subtitle="Editable, includes editor state"
+            @click="handleSqpzExport(true)"
+          />
+          <v-list-item 
+            prepend-icon="mdi-eye" 
+            title="Production Mode"
+            subtitle="Viewer only, optimized"
+            @click="handleSqpzExport(false)"
+          />
+        </v-list>
+      </v-menu>
     </v-btn-group>
+    
+    <v-divider vertical class="mx-2" />
+    
+    <v-btn
+      prepend-icon="mdi-eye"
+      size="small"
+      variant="text"
+      :color="appStore.viewerMode ? 'primary' : undefined"
+      :disabled="!appStore.hasScene"
+      @click="toggleViewerMode"
+    >
+      {{ appStore.viewerMode ? 'Exit Viewer' : 'Viewer Mode' }}
+    </v-btn>
     
     <v-divider vertical class="mx-2" />
     
