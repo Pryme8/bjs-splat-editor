@@ -35,6 +35,8 @@ export interface JobConfig {
   // AI Enhancement: Learned Features (DISK + LightGlue)
   learnedFeaturesEnabled?: boolean
   learnedFeaturesMaxKeypoints?: number
+  // Trainer engine selection
+  trainerEngine?: 'opensplat' | 'gsplat' | 'auto'
 }
 
 export interface BackendHealth {
@@ -44,7 +46,9 @@ export interface BackendHealth {
     colmap: boolean
     redis: boolean
     opensplat: boolean
+    gsplat: boolean
   }
+  opensplatDocker?: boolean
 }
 
 // COLMAP Preview types
@@ -83,6 +87,8 @@ type ProgressCallback = (progress: {
   splatCount?: number
   intermediateReady?: boolean
   colmapPreviewReady?: boolean
+  deviceType?: 'gpu' | 'cpu'
+  deviceName?: string
 }) => void
 
 // Console message types
@@ -349,7 +355,9 @@ class BackendApiService {
                 totalIterations: data.totalIterations,
                 splatCount: data.splatCount,
                 intermediateReady: data.intermediateReady,
-                colmapPreviewReady: data.colmapPreviewReady
+                colmapPreviewReady: data.colmapPreviewReady,
+                deviceType: data.deviceType,
+                deviceName: data.deviceName
               })).catch(err => {
                 console.error('[BackendApi] Progress callback error:', err)
               })
@@ -401,6 +409,17 @@ class BackendApiService {
       this.ws.close()
       this.ws = null
     }
+  }
+
+  /**
+   * Clean up all resources (for page unload)
+   */
+  Cleanup(): void {
+    console.log('[BackendApi] Cleaning up...')
+    this.DisconnectWebSocket()
+    this.progressCallbacks.clear()
+    this.consoleCallback = null
+    this.consoleHistoryCallback = null
   }
 
   /**
@@ -465,6 +484,128 @@ class BackendApiService {
       }))
     }
   }
+
+  // ============================================
+  // Semantic Selection API
+  // ============================================
+
+  /**
+   * Check if semantic segmentation is available on the backend
+   */
+  async CheckSemanticSelectStatus(): Promise<SemanticSelectStatus | null> {
+    try {
+      console.log(`[BackendApi] Checking semantic select status at ${API_URL}/api/semantic-select/status`)
+      const response = await fetch(`${API_URL}/api/semantic-select/status`, {
+        signal: AbortSignal.timeout(60000) // 60s timeout - first call loads heavy ML libraries
+      })
+      console.log(`[BackendApi] Semantic select status response:`, response.status)
+      if (response.ok) {
+        const data = await response.json()
+        console.log(`[BackendApi] Semantic select status:`, data)
+        return data
+      } else {
+        console.warn(`[BackendApi] Semantic select status returned ${response.status}`)
+      }
+    } catch (error) {
+      console.warn('[BackendApi] Semantic select status check failed:', error)
+    }
+    return null
+  }
+
+  /**
+   * Run semantic segmentation on provided images
+   * 
+   * @param images Array of images with filenames and base64 data URLs
+   * @param prompt Text prompt describing what to select
+   * @param config Optional configuration
+   * @returns Segmentation result with masks
+   */
+  async RunSemanticSelect(
+    images: Array<{ filename: string; data: string }>,
+    prompt: string,
+    config?: SemanticSelectConfig
+  ): Promise<SemanticSelectResult | null> {
+    try {
+      console.log(`[BackendApi] Running semantic select with prompt: "${prompt}" on ${images.length} images`)
+      
+      // Build FormData with image files
+      const formData = new FormData()
+      formData.append('prompt', prompt)
+      
+      if (config?.boxThreshold !== undefined) {
+        formData.append('boxThreshold', config.boxThreshold.toString())
+      }
+      if (config?.textThreshold !== undefined) {
+        formData.append('textThreshold', config.textThreshold.toString())
+      }
+      
+      // Convert data URLs to Blobs and append as files
+      for (const img of images) {
+        const blob = await this.DataUrlToBlob(img.data)
+        formData.append('images', blob, img.filename)
+      }
+      
+      const response = await fetch(`${API_URL}/api/semantic-select`, {
+        method: 'POST',
+        body: formData
+        // Note: Don't set Content-Type header - browser sets it with boundary for FormData
+      })
+
+      if (!response.ok) {
+        const error = await response.json()
+        throw new Error(error.error || 'Semantic selection failed')
+      }
+
+      const result = await response.json()
+      console.log(`[BackendApi] Semantic select complete: ${result.images_with_detections}/${result.images_processed} images had detections`)
+      return result
+    } catch (error) {
+      console.error('[BackendApi] Semantic select failed:', error)
+      throw error
+    }
+  }
+  
+  /**
+   * Convert a data URL to a Blob
+   */
+  private async DataUrlToBlob(dataUrl: string): Promise<Blob> {
+    const response = await fetch(dataUrl)
+    return response.blob()
+  }
+}
+
+// Semantic selection types
+export interface SemanticSelectStatus {
+  available: boolean
+  dependencies: {
+    available: boolean
+    missing: string[]
+  }
+}
+
+export interface SemanticSelectConfig {
+  boxThreshold?: number
+  textThreshold?: number
+}
+
+export interface SemanticSelectMask {
+  filename: string
+  width: number
+  height: number
+  has_detection: boolean
+  selected_pixels?: number
+  total_pixels?: number
+  coverage?: number
+  mask_base64?: string
+}
+
+export interface SemanticSelectResult {
+  success: boolean
+  sessionId: string
+  prompt: string
+  images_processed: number
+  images_with_detections: number
+  masks: SemanticSelectMask[]
 }
 
 // Singleton instance

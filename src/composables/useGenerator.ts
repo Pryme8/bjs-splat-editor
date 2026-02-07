@@ -8,6 +8,7 @@ import { useAppStore } from '@/stores/appStore'
 import { useSceneStore } from '@/stores/sceneStore'
 import { useBabylon } from '@/composables/useBabylon'
 import { exportToPly, exportToSplat, downloadPly, downloadSplat } from '@/services/PlyExporter'
+import { parsePlyToSplatData } from '@/services/PlyParser'
 import { BackendApi } from '@/services/BackendApi'
 import type { GenerationResult } from '@/generator/GeneratorService'
 
@@ -92,17 +93,25 @@ export function useGenerator() {
 
   /**
    * Download generation result as PLY file
+   * Strips higher-order spherical harmonics for smaller file size
    */
-  function downloadAsPly(filename: string = 'generated-splats.ply') {
+  async function downloadAsPly(filename: string = 'generated-splats.ply') {
     const result = generatorStore.result as any
     if (!result) {
       throw new Error('No generation result available')
     }
     
-    // For backend results, we have the original blob
+    // For backend results, parse and re-export to strip extra SH data
     if (result._blob) {
-      console.log('[useGenerator] Downloading backend PLY blob:', result._blob.size, 'bytes')
-      downloadBlob(result._blob, filename)
+      console.log('[useGenerator] Parsing backend PLY blob:', result._blob.size, 'bytes')
+      try {
+        const splatData = await parsePlyToSplatData(result._blob)
+        console.log('[useGenerator] Re-exporting with stripped SH data')
+        downloadPly(splatData, filename)
+      } catch (error) {
+        console.error('[useGenerator] Failed to parse PLY, downloading original:', error)
+        downloadBlob(result._blob, filename)
+      }
     } else {
       // For browser-generated results, export from arrays
       downloadPly(result, filename)
@@ -111,20 +120,25 @@ export function useGenerator() {
 
   /**
    * Download generation result as .splat file
+   * Strips higher-order spherical harmonics for smaller file size
    */
-  function downloadAsSplat(filename: string = 'generated-splats.splat') {
+  async function downloadAsSplat(filename: string = 'generated-splats.splat') {
     const result = generatorStore.result as any
     if (!result) {
       throw new Error('No generation result available')
     }
     
-    // For backend results, we have the original blob (which is PLY format)
-    // For now, download as PLY since that's what the backend produces
+    // For backend results, parse PLY and convert to .splat format
     if (result._blob) {
-      console.log('[useGenerator] Downloading backend blob as splat:', result._blob.size, 'bytes')
-      // The backend produces PLY, so download that with .ply extension
-      // TODO: Add server-side conversion to .splat format
-      downloadBlob(result._blob, filename.replace('.splat', '.ply'))
+      console.log('[useGenerator] Parsing backend blob for .splat export:', result._blob.size, 'bytes')
+      try {
+        const splatData = await parsePlyToSplatData(result._blob)
+        console.log('[useGenerator] Converting to .splat format with stripped SH data')
+        downloadSplat(splatData, filename)
+      } catch (error) {
+        console.error('[useGenerator] Failed to parse PLY:', error)
+        throw error
+      }
     } else {
       // For browser-generated results, export from arrays
       downloadSplat(result, filename)

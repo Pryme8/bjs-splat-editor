@@ -15,10 +15,12 @@ import fs from 'fs/promises'
 import type { Job, JobConfig, JobProgress, TrainingResult, CameraInfo } from '../types/index.js'
 import { updateJobStatus, completeJob, failJob, updateJob } from './jobManager.js'
 import { runColmapPipeline, checkColmapAvailable } from './colmap.js'
-import { trainWithOpenSplat, checkOpenSplatAvailable, checkOpenSplatGPU, getOpenSplatGPUInfo } from './opensplat.js'
+import { trainWithOpenSplat, checkOpenSplatAvailable, checkOpenSplatGPU, getOpenSplatGPUInfo, isDockerMode } from './opensplat.js'
+import { trainWithGsplat, checkGsplatAvailable } from './gsplatTrainer.js'
 import { cleanupPly, DefaultCleanupConfig, type CleanupConfig } from './plyCleanup.js'
 import { checkDepthEstimationAvailable, estimateDepth, type DepthSummary } from './depthEstimation.js'
 import { detectFloaters, removeFloatersFromPly, type Camera } from './depthFloaterFilter.js'
+import type { TrainerEngine } from '../types/index.js'
 
 // Cache for resolved capabilities
 let cachedGpuAvailable: boolean | null = null
@@ -108,13 +110,16 @@ export async function processTrainingJob(
       jobId,
       status: 'preprocessing',
       progress: 0,
-      message: 'Starting processing pipeline...'
+      message: 'Starting processing pipeline...',
+      deviceType: 'cpu',
+      deviceName: 'CPU'
     })
 
     // Check prerequisites
-    const [colmapAvailable, opensplatAvailable] = await Promise.all([
+    const [colmapAvailable, opensplatAvailable, gsplatAvailable] = await Promise.all([
       checkColmapAvailable(),
-      checkOpenSplatAvailable()
+      checkOpenSplatAvailable(),
+      checkGsplatAvailable()
     ])
 
     if (!colmapAvailable) {
@@ -125,13 +130,43 @@ export async function processTrainingJob(
       )
     }
 
-    if (!opensplatAvailable) {
-      throw new Error(
-        'OpenSplat is required for Gaussian Splat training but was not found.\n' +
-        'Please install OpenSplat and set OPENSPLAT_PATH environment variable.\n' +
-        'Download from: https://github.com/pierotofy/OpenSplat'
-      )
+    // Resolve which trainer engine to use
+    const requestedEngine: TrainerEngine = config.trainerEngine || 'auto'
+    let resolvedEngine: 'opensplat' | 'gsplat'
+
+    if (requestedEngine === 'gsplat') {
+      if (!gsplatAvailable) {
+        throw new Error(
+          'gsplat trainer requested but not available.\n' +
+          'Install with: pip install gaussian-splatting\n' +
+          'Note: RTX 50xx GPUs require CUDA Toolkit 12.8+ for source build.'
+        )
+      }
+      resolvedEngine = 'gsplat'
+    } else if (requestedEngine === 'opensplat') {
+      if (!opensplatAvailable) {
+        throw new Error(
+          'OpenSplat trainer requested but not found.\n' +
+          'Please install OpenSplat and set OPENSPLAT_PATH environment variable.\n' +
+          'Download from: https://github.com/pierotofy/OpenSplat'
+        )
+      }
+      resolvedEngine = 'opensplat'
+    } else {
+      // Auto mode: prefer gsplat (Python/PyTorch native GPU), fall back to OpenSplat
+      if (gsplatAvailable) {
+        resolvedEngine = 'gsplat'
+      } else if (opensplatAvailable) {
+        resolvedEngine = 'opensplat'
+      } else {
+        throw new Error(
+          'No Gaussian Splat trainer available.\n' +
+          'Install OpenSplat (set OPENSPLAT_PATH) or gaussian-splatting (pip install gaussian-splatting).'
+        )
+      }
     }
+
+    console.log(`[TrainingWorker] Trainer engine: requested=${requestedEngine}, resolved=${resolvedEngine}`)
 
     // Verify images exist
     const images = await fs.readdir(imagesDir)
@@ -145,7 +180,9 @@ export async function processTrainingJob(
       jobId,
       status: 'preprocessing',
       progress: 5,
-      message: `Found ${imageFiles.length} images, preparing...`
+      message: `Found ${imageFiles.length} images, preparing...`,
+      deviceType: 'cpu',
+      deviceName: 'CPU'
     })
 
     // Create images symlink/copy for COLMAP (it expects images in specific location)
@@ -163,7 +200,9 @@ export async function processTrainingJob(
       jobId,
       status: 'preprocessing',
       progress: 10,
-      message: `Prepared ${imageFiles.length} images for processing`
+      message: `Prepared ${imageFiles.length} images for processing`,
+      deviceType: 'cpu',
+      deviceName: 'CPU'
     })
 
     // Optional: Run Depth Anything for depth estimation
@@ -177,6 +216,10 @@ export async function processTrainingJob(
       const depthAvailable = await checkDepthEstimationAvailable()
       
       if (depthAvailable) {
+        // Start with unknown device, will be updated once Python reports it
+        let depthDeviceType: 'gpu' | 'cpu' | undefined
+        let depthDeviceName: string | undefined
+        
         onProgress({
           jobId,
           status: 'depth_estimation',
@@ -192,18 +235,43 @@ export async function processTrainingJob(
               modelSize: config.depthModelSize || 'small',
               saveVisualization: true
             },
-            (line) => {
-              if (line.includes('%') || line.includes('Estimating')) {
+            (line, deviceInfoUpdate) => {
+              // Update device info if provided
+              if (deviceInfoUpdate?.deviceType) {
+                depthDeviceType = deviceInfoUpdate.deviceType
+                depthDeviceName = deviceInfoUpdate.deviceName
+              }
+              
+              if (line.includes('%') || line.includes('Estimating') || line.includes('Device detected')) {
                 onProgress({
                   jobId,
                   status: 'depth_estimation',
                   progress: 12,
-                  message: `Depth estimation: ${line.substring(0, 60)}...`
+                  message: line.includes('Device detected') 
+                    ? `Depth estimation on ${depthDeviceName || 'unknown'}...`
+                    : `Depth estimation: ${line.substring(0, 60)}...`,
+                  deviceType: depthDeviceType,
+                  deviceName: depthDeviceName
                 })
               }
             },
             jobId
           )
+          
+          // Update device info from result and send final progress
+          if (depthSummary) {
+            depthDeviceType = depthSummary.device_type
+            depthDeviceName = depthSummary.device_name
+            
+            onProgress({
+              jobId,
+              status: 'depth_estimation',
+              progress: 14,
+              message: `Depth estimation complete (${depthSummary.device_name || 'unknown'})`,
+              deviceType: depthDeviceType,
+              deviceName: depthDeviceName
+            })
+          }
           
           console.log(`[TrainingWorker] Depth estimation complete: ${depthSummary.successful}/${depthSummary.total_images} images`)
           
@@ -211,7 +279,9 @@ export async function processTrainingJob(
             jobId,
             status: 'depth_estimation',
             progress: 14,
-            message: `Depth maps generated for ${depthSummary.successful} images`
+            message: `Depth maps generated for ${depthSummary.successful} images`,
+            deviceType: depthDeviceType || 'cpu',
+            deviceName: depthDeviceName || 'CPU'
           })
         } catch (depthError) {
           console.warn(`[TrainingWorker] Depth estimation failed, continuing without:`, depthError)
@@ -219,7 +289,9 @@ export async function processTrainingJob(
             jobId,
             status: 'preprocessing',
             progress: 14,
-            message: 'Depth estimation failed, continuing without depth filtering'
+            message: 'Depth estimation failed, continuing without depth filtering',
+            deviceType: 'cpu',
+            deviceName: 'CPU'
           })
         }
       } else {
@@ -228,7 +300,9 @@ export async function processTrainingJob(
           jobId,
           status: 'preprocessing',
           progress: 14,
-          message: 'Depth estimation not available (Python/dependencies missing)'
+          message: 'Depth estimation not available (Python/dependencies missing)',
+          deviceType: 'cpu',
+          deviceName: 'CPU'
         })
       }
     }
@@ -238,7 +312,9 @@ export async function processTrainingJob(
       jobId,
       status: 'sfm_features',
       progress: 15,
-      message: 'Running Structure from Motion (COLMAP)...'
+      message: 'Running Structure from Motion (COLMAP)...',
+      deviceType: 'cpu',  // COLMAP runs on CPU
+      deviceName: 'CPU'
     })
 
     // Log learned features config
@@ -259,7 +335,11 @@ export async function processTrainingJob(
           jobId,
           status: partial.status || 'sfm_features',
           progress: partial.progress || 15,
-          message: partial.message || 'Processing...'
+          message: partial.message || 'Processing...',
+          // Use device info from partial if available (for learned features GPU detection),
+          // otherwise default to CPU (traditional COLMAP)
+          deviceType: partial.deviceType || 'cpu',
+          deviceName: partial.deviceName || 'CPU'
         })
       }
     })
@@ -272,15 +352,19 @@ export async function processTrainingJob(
       status: 'training_init',
       progress: 75,
       message: `SfM complete: ${colmapResult.cameras.length} cameras, ${colmapResult.points3DCount} points`,
-      colmapPreviewReady: true  // Signal frontend to fetch and display COLMAP preview
+      colmapPreviewReady: true,  // Signal frontend to fetch and display COLMAP preview
+      deviceType: 'cpu',
+      deviceName: 'CPU'
     })
 
-    // Get detailed GPU info
+    // Get detailed GPU info and set device for all subsequent progress updates
     const gpuInfo = await getOpenSplatGPUInfo()
     const gpuAvailable = gpuInfo.nvidiaGpuDetected
     const useGpu = config.trainingMode === 'gpu' || (config.trainingMode === 'auto' && gpuAvailable)
     
     const modeLabel = useGpu ? 'GPU' : 'CPU'
+    const trainingDeviceType: 'gpu' | 'cpu' = useGpu ? 'gpu' : 'cpu'
+    const trainingDeviceName = useGpu ? (gpuInfo.gpuName || 'GPU') : 'CPU'
     
     // Log GPU info and any warnings
     if (gpuInfo.gpuName) {
@@ -290,39 +374,58 @@ export async function processTrainingJob(
       console.warn(`[TrainingWorker] GPU Warning: ${gpuInfo.warning}`)
     }
     
-    let initMessage = `Starting OpenSplat training (${modeLabel})...`
-    // Add warning hint for newer GPUs
-    if (gpuInfo.warning && useGpu) {
-      initMessage = `Starting OpenSplat training... (Note: Pre-built binaries may use CPU)`
-    }
+    console.log(`[TrainingWorker] Training will use: ${trainingDeviceName} (${trainingDeviceType})`)
+    
+    const engineLabel = resolvedEngine === 'gsplat' ? 'gsplat (Python/PyTorch)' : 
+                        isDockerMode() ? 'OpenSplat (Docker GPU)' : `OpenSplat (${modeLabel})`
+    let initMessage = `Starting ${engineLabel} training...`
     
     onProgress({
       jobId,
       status: 'training_init',
       progress: 78,
-      message: initMessage
+      message: initMessage,
+      deviceType: trainingDeviceType,
+      deviceName: trainingDeviceName
     })
 
-    // Run OpenSplat training
-    const result = await trainWithOpenSplat({
-      jobId,
-      imagesDir: colmapImagesDir,
-      outputDir,
-      colmapData: colmapResult,
-      config,
-      onProgress: (partial) => {
-        onProgress({
-          jobId,
-          status: 'training',
-          progress: partial.progress || 80,
-          message: partial.message || 'Training...',
-          iteration: partial.iteration,
-          totalIterations: partial.totalIterations,
-          splatCount: partial.splatCount,
-          intermediateReady: (partial as any).intermediateReady
-        })
-      }
-    })
+    // Run training with the resolved engine
+    const trainProgressCallback = (partial: Partial<JobProgress>) => {
+      onProgress({
+        jobId,
+        status: 'training',
+        progress: partial.progress || 80,
+        message: partial.message || 'Training...',
+        iteration: partial.iteration,
+        totalIterations: partial.totalIterations,
+        splatCount: partial.splatCount,
+        intermediateReady: (partial as any).intermediateReady,
+        deviceType: trainingDeviceType,
+        deviceName: trainingDeviceName
+      })
+    }
+
+    let result: TrainingResult
+
+    if (resolvedEngine === 'gsplat') {
+      result = await trainWithGsplat({
+        jobId,
+        imagesDir: colmapImagesDir,
+        outputDir,
+        colmapData: colmapResult,
+        config,
+        onProgress: trainProgressCallback
+      })
+    } else {
+      result = await trainWithOpenSplat({
+        jobId,
+        imagesDir: colmapImagesDir,
+        outputDir,
+        colmapData: colmapResult,
+        config,
+        onProgress: trainProgressCallback
+      })
+    }
 
     // Post-processing: Depth-based floater filtering (if depth maps available)
     let finalSplatCount = result.splatCount
@@ -337,7 +440,9 @@ export async function processTrainingJob(
         status: 'depth_filtering',
         progress: 93,
         message: 'Running AI-assisted floater detection...',
-        splatCount: result.splatCount
+        splatCount: result.splatCount,
+        deviceType: 'cpu',  // Post-processing runs on CPU
+        deviceName: 'CPU'
       })
 
       try {
@@ -387,7 +492,9 @@ export async function processTrainingJob(
               status: 'depth_filtering',
               progress: 95,
               message: `AI depth filter removed ${floaterResult.floatersDetected} floaters`,
-              splatCount: finalSplatCount
+              splatCount: finalSplatCount,
+              deviceType: 'cpu',
+              deviceName: 'CPU'
             })
           } else {
             console.log('[TrainingWorker] Depth filtering found no floaters')
@@ -405,7 +512,9 @@ export async function processTrainingJob(
       status: 'exporting',
       progress: 96,
       message: 'Running standard floater cleanup...',
-      splatCount: finalSplatCount
+      splatCount: finalSplatCount,
+      deviceType: 'cpu',
+      deviceName: 'CPU'
     })
 
     const cleanupConfig: CleanupConfig = {
@@ -432,7 +541,9 @@ export async function processTrainingJob(
           status: 'exporting',
           progress: 98,
           message: `Cleanup removed ${removedByCleanup} additional floaters`,
-          splatCount: finalSplatCount
+          splatCount: finalSplatCount,
+          deviceType: 'cpu',
+          deviceName: 'CPU'
         })
       } catch (cleanupError) {
         console.warn(`[TrainingWorker] Cleanup failed, using current version:`, cleanupError)
@@ -446,7 +557,9 @@ export async function processTrainingJob(
       status: 'exporting',
       progress: 99,
       message: 'Finalizing results...',
-      splatCount: finalSplatCount
+      splatCount: finalSplatCount,
+      deviceType: 'cpu',
+      deviceName: 'CPU'
     })
 
     const trainingTime = (Date.now() - startTime) * 0.001
@@ -460,7 +573,9 @@ export async function processTrainingJob(
       status: 'complete',
       progress: 100,
       message: `Training complete! ${finalSplatCount.toLocaleString()} splats generated in ${Math.round(trainingTime)}s`,
-      splatCount: finalSplatCount
+      splatCount: finalSplatCount,
+      deviceType: 'cpu',
+      deviceName: 'CPU'
     })
 
     return {
@@ -478,7 +593,9 @@ export async function processTrainingJob(
       jobId,
       status: 'failed',
       progress: 0,
-      message: errorMessage
+      message: errorMessage,
+      deviceType: 'cpu',
+      deviceName: 'CPU'
     })
 
     throw error

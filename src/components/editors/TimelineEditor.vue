@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useVideoFrameStore } from '@/stores/videoFrameStore'
+import DragNumberInput from '@/components/common/DragNumberInput.vue'
 
 const props = defineProps<{
   duration: number
@@ -535,16 +536,12 @@ onUnmounted(() => {
             
             <div class="custom-interval mt-3">
               <span class="text-secondary">Or custom:</span>
-              <v-text-field
-                v-model.number="rangeInterval"
-                type="number"
+              <DragNumberInput
+                v-model="rangeInterval"
                 :min="0.1"
                 :max="60"
                 :step="0.1"
                 suffix="sec"
-                density="compact"
-                variant="outlined"
-                hide-details
                 class="custom-interval-input"
                 @focus="clearPresetSelection"
               />

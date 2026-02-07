@@ -96,6 +96,14 @@ async function handleDrop(e: DragEvent) {
           @click="editor.focusOnSplat"
           title="Focus on Splat"
         />
+        <v-divider vertical class="mx-1" />
+        <v-btn
+          icon="mdi-debug-step-over"
+          size="small"
+          variant="text"
+          @click="editor.toggleInspector"
+          title="Toggle Inspector (Ctrl+Shift+I)"
+        />
       </div>
     </div>
   </div>
@@ -116,6 +124,7 @@ async function handleDrop(e: DragEvent) {
     height: 100% !important;
     outline: none;
     display: block;
+    touch-action: none;
   }
 }
 

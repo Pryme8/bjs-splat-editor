@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { useAppStore } from '@/stores/appStore'
 import { useSplatEditor } from '@/composables/useSplatEditor'
+import { useBabylon } from '@/composables/useBabylon'
 
 const emit = defineEmits<{
   toggleSidebar: []
@@ -11,6 +12,7 @@ const emit = defineEmits<{
 
 const appStore = useAppStore()
 const editor = useSplatEditor()
+const babylon = useBabylon()
 const showExportMenu = ref(false)
 
 function handleFileImport() {
@@ -27,19 +29,27 @@ function handleFileImport() {
 }
 
 function handleExport(format: 'ply' | 'splat') {
-  const file = appStore.currentFile
-  if (!file) return
+  // Get the WORKING file (with all modifications) not the original
+  const workingFile = babylon.getOriginalFile()
+  if (!workingFile) {
+    console.error('[Export] No working file available')
+    return
+  }
   
   const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '')
   const filename = `export-${timestamp}.${format}`
   
-  // Download from the blob URL
+  // Create a temporary blob URL from the working file
+  const url = URL.createObjectURL(workingFile.blob)
   const a = document.createElement('a')
-  a.href = file.url
+  a.href = url
   a.download = filename
   document.body.appendChild(a)
   a.click()
   document.body.removeChild(a)
+  
+  // Clean up the temporary URL
+  URL.revokeObjectURL(url)
   
   showExportMenu.value = false
 }

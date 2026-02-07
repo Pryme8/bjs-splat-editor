@@ -88,6 +88,23 @@ export const SceneTypeDescriptions: Record<SceneType, string> = {
 export type DepthModelSize = 'small' | 'base' | 'large'
 
 /**
+ * Trainer engine selection
+ */
+export type TrainerEngine = 'opensplat' | 'gsplat' | 'auto'
+
+export const TrainerEngineLabels: Record<TrainerEngine, string> = {
+  auto: 'Auto',
+  opensplat: 'OpenSplat',
+  gsplat: 'gsplat'
+}
+
+export const TrainerEngineDescriptions: Record<TrainerEngine, string> = {
+  auto: 'Automatically select best available trainer (prefers gsplat for native GPU)',
+  opensplat: 'C++ binary - fast but requires matching CUDA version',
+  gsplat: 'Python/PyTorch native - uses GPU directly via installed PyTorch'
+}
+
+/**
  * Generation configuration
  */
 export interface GenerationConfig {
@@ -114,11 +131,13 @@ export interface GenerationConfig {
   // AI Enhancement: Learned Feature Matching (DISK + LightGlue)
   learnedFeaturesEnabled?: boolean
   learnedFeaturesMaxKeypoints?: number
+  // Trainer engine
+  trainerEngine?: TrainerEngine
 }
 
 export const DefaultConfig: GenerationConfig = {
   iterations: 30000,  // OpenSplat default - more iterations = more splats
-  resolution: 512,
+  resolution: 1024,
   learningRate: 0.0016,
   initialSplatCount: 2000,
   densifyInterval: 200,
@@ -139,7 +158,9 @@ export const DefaultConfig: GenerationConfig = {
   depthFloaterThreshold: 0.15,
   // Learned features defaults
   learnedFeaturesEnabled: false,
-  learnedFeaturesMaxKeypoints: 2048
+  learnedFeaturesMaxKeypoints: 2048,
+  // Trainer engine
+  trainerEngine: 'auto'
 }
 
 /**

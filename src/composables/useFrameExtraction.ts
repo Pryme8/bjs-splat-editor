@@ -8,7 +8,7 @@ import { ref } from 'vue'
 import { useVideoFrameStore } from '@/stores/videoFrameStore'
 
 export interface ExtractionOptions {
-  quality?: number  // JPEG quality 0-1, default 0.95
+  quality?: number  // Image quality 0-1, default 1.0 (lossless for PNG)
   format?: 'image/jpeg' | 'image/png'
   onProgress?: (current: number, total: number) => void
 }
@@ -41,7 +41,7 @@ export function useFrameExtraction() {
     time: number,
     options: ExtractionOptions = {}
   ): Promise<File> {
-    const { quality = 0.95, format = 'image/jpeg' } = options
+    const { quality = 1.0, format = 'image/png' } = options
     
     // Seek to time
     video.currentTime = time

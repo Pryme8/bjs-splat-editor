@@ -7,10 +7,13 @@ import AppCanvas from './components/layout/AppCanvas.vue'
 import ConsolePanel from './components/panels/ConsolePanel.vue'
 import { useSplatEditor } from './composables/useSplatEditor'
 import { useAppStore } from './stores/appStore'
+import { useBabylon } from './composables/useBabylon'
+import { BackendApi } from './services/BackendApi'
 
 const sidebarOpen = ref(true)
 const editor = useSplatEditor()
 const appStore = useAppStore()
+const babylon = useBabylon()
 
 // Console panel height when open
 const consolePanelHeight = ref(180)
@@ -40,12 +43,26 @@ function handleKeyDown(e: KeyboardEvent) {
   }
 }
 
+// Cleanup handler
+function handleCleanup() {
+  console.log('[App] Cleaning up resources...')
+  BackendApi.Cleanup()
+}
+
+// Handle page unload
+function handleBeforeUnload() {
+  handleCleanup()
+}
+
 onMounted(() => {
   window.addEventListener('keydown', handleKeyDown)
+  window.addEventListener('beforeunload', handleBeforeUnload)
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeyDown)
+  window.removeEventListener('beforeunload', handleBeforeUnload)
+  handleCleanup()
 })
 </script>
 
@@ -82,6 +99,40 @@ onUnmounted(() => {
         </transition>
       </div>
     </v-main>
+
+    <!-- Y-Axis Flip Dialog for PLY/SPZ imports -->
+    <v-dialog
+      :model-value="!!babylon.showYFlipPrompt.value"
+      max-width="420"
+      persistent
+    >
+      <v-card class="yflip-dialog">
+        <v-card-title class="text-subtitle-1 font-weight-bold">
+          Coordinate System Conversion
+        </v-card-title>
+        <v-card-text>
+          This file was imported with an inverted Y-axis. Would you like to automatically
+          correct the orientation? This will flip the Y scale, rotate Z by 180°, and
+          bake the transform into the vertex data.
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn
+            variant="text"
+            @click="babylon.dismissYFlipPrompt()"
+          >
+            Keep As-Is
+          </v-btn>
+          <v-btn
+            color="primary"
+            variant="flat"
+            @click="babylon.autoFlipAndBake()"
+          >
+            Auto-Flip
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </v-app>
 </template>
 
@@ -157,5 +208,10 @@ onUnmounted(() => {
 .slide-up-leave-to {
   transform: translateY(100%);
   opacity: 0;
+}
+
+.yflip-dialog {
+  background: #1E1E2E !important;
+  border: 1px solid #3A3A4A;
 }
 </style>

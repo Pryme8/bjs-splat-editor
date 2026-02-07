@@ -10,30 +10,49 @@ import { spawn } from 'child_process'
 import path from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
+import { registerProcess } from './processTracker.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const SCRIPT_PATH = path.join(__dirname, '../../scripts/superpoint_lightglue.py')
 
+export type MatchStrategy = 'exhaustive' | 'window' | 'retrieval'
+
 export interface LearnedFeaturesConfig {
-  maxKeypoints?: number      // Max keypoints per image (default: 2048)
-  maxImageSize?: number      // Resize images larger than this (default: 1600)
-  sequentialMatching?: boolean // Use sequential instead of exhaustive matching
-  onProgress?: (message: string, phase: 'features' | 'matching', current: number, total: number) => void
+  maxKeypoints?: number        // Max keypoints per image (default: 2048)
+  maxImageSize?: number        // Resize images larger than this (default: 1600)
+  sequentialMatching?: boolean // (Legacy) Use sequential matching - maps to window strategy
+  matchStrategy?: MatchStrategy // Pair selection strategy (default: 'window')
+  matchWindow?: number         // Window size for 'window' strategy (default: 10)
+  matchTopk?: number           // Top-k for 'retrieval' strategy (default: 15)
+  skipVerification?: boolean   // Skip per-pair RANSAC (default: false, COLMAP mapper needs two_view_geometries)
+  jobId?: string              // Job ID for process tracking
+  onProgress?: (
+    message: string, 
+    phase: 'features' | 'matching', 
+    current: number, 
+    total: number,
+    deviceInfo?: { deviceType?: 'gpu' | 'cpu', deviceName?: string }
+  ) => void
 }
 
 export interface LearnedFeaturesResult {
   images: number
+  match_strategy?: string
+  total_pairs?: number
   pairs_matched: number
   total_matches: number
   avg_keypoints_per_image: number
   avg_matches_per_pair: number
   database: string
-  // Geometric verification stats (new)
+  // Geometric verification stats
   verified_pairs?: number
   total_inliers?: number
   avg_inliers_per_pair?: number
+  // Device info
+  device_type?: 'gpu' | 'cpu'
+  device_name?: string
 }
 
 /**
@@ -73,6 +92,11 @@ export async function extractLearnedFeatures(
     maxKeypoints = 2048,
     maxImageSize = 1600,
     sequentialMatching = false,
+    matchStrategy,
+    matchWindow = 10,
+    matchTopk = 15,
+    skipVerification = false,
+    jobId,
     onProgress
   } = config
 
@@ -92,8 +116,23 @@ export async function extractLearnedFeatures(
       '--json'
     ]
     
-    if (sequentialMatching) {
+    // Match strategy: new args take priority over legacy --sequential
+    if (matchStrategy) {
+      args.push('--match_strategy', matchStrategy)
+      if (matchStrategy === 'window') {
+        args.push('--match_window', matchWindow.toString())
+      } else if (matchStrategy === 'retrieval') {
+        args.push('--match_topk', matchTopk.toString())
+      }
+    } else if (sequentialMatching) {
       args.push('--sequential')
+    }
+    
+    // Verification control
+    if (skipVerification) {
+      args.push('--skip_verification')
+    } else {
+      args.push('--verify')
     }
 
     console.log(`[LearnedFeatures] Running: python -u ${args.join(' ')}`)
@@ -102,9 +141,15 @@ export async function extractLearnedFeatures(
     const proc = spawn('python', ['-u', ...args], {
       stdio: ['pipe', 'pipe', 'pipe']
     })
+    
+    // Register process for cleanup on job cancellation
+    if (jobId) {
+      registerProcess(jobId, proc)
+    }
 
     let stdout = ''
     let stderr = ''
+    let deviceInfo: { deviceType?: 'gpu' | 'cpu', deviceName?: string } = {}
 
     proc.stdout.on('data', (data) => {
       stdout += data.toString()
@@ -121,18 +166,38 @@ export async function extractLearnedFeatures(
         if (trimmed) {
           // Always log to console for streaming to frontend
           console.log(`[LearnedFeatures] ${trimmed}`)
+          
+          // Capture device info from stderr
+          if (trimmed.includes('Using CUDA GPU:')) {
+            deviceInfo.deviceType = 'gpu'
+            const match = trimmed.match(/Using CUDA GPU:\s*(.+)/)
+            if (match) deviceInfo.deviceName = match[1].trim()
+          } else if (trimmed.includes('Using Apple Metal GPU')) {
+            deviceInfo.deviceType = 'gpu'
+            deviceInfo.deviceName = 'Apple Metal'
+          } else if (trimmed.includes('Using CPU')) {
+            deviceInfo.deviceType = 'cpu'
+            deviceInfo.deviceName = 'CPU'
+          }
         }
       }
       
       // Parse tqdm progress: "Features:  50%|#####     | 12/25"
       // or "Matching:  50%|#####     | 150/300"
-      const progressMatch = text.match(/(Features|Matching):\s*(\d+)%\|[^|]+\|\s*(\d+)\/(\d+)/)
-      if (progressMatch && onProgress) {
-        const phase = progressMatch[1].toLowerCase() as 'features' | 'matching'
-        const current = parseInt(progressMatch[3])
-        const total = parseInt(progressMatch[4])
-        const message = `${progressMatch[1]}: ${current}/${total}`
-        onProgress(message, phase, current, total)
+      // tqdm uses \r to overwrite the line, so a single chunk may contain
+      // multiple progress updates - we need the LAST one (most recent)
+      const progressRegex = /(Features|Matching):\s*(\d+)%\|[^|]+\|\s*(\d+)\/(\d+)/g
+      let progressMatch: RegExpExecArray | null = null
+      let lastMatch: RegExpExecArray | null = null
+      while ((progressMatch = progressRegex.exec(text)) !== null) {
+        lastMatch = progressMatch
+      }
+      if (lastMatch && onProgress) {
+        const phase = lastMatch[1].toLowerCase() as 'features' | 'matching'
+        const current = parseInt(lastMatch[3])
+        const total = parseInt(lastMatch[4])
+        const message = `${lastMatch[1]}: ${current}/${total}`
+        onProgress(message, phase, current, total, deviceInfo)
       }
     })
 

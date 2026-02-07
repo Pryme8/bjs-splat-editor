@@ -116,7 +116,8 @@ async function exportFrames() {
     videoRef.value.pause()
     
     const files = await frameExtraction.extractAllFromStore(videoRef.value, {
-      quality: 0.95,
+      quality: 1.0,
+      format: 'image/png',
       onProgress: (current, total) => {
         console.log(`Extracting frame ${current}/${total}`)
       }

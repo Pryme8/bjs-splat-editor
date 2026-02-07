@@ -16,7 +16,9 @@ import {
   VertexData,
   KeyboardEventTypes,
   PointerEventTypes,
-  Matrix
+  Matrix,
+  Tools,
+  Viewport
 } from '@babylonjs/core'
 import type { Observer } from '@babylonjs/core/Misc/observable'
 import type { PointerInfo } from '@babylonjs/core/Events/pointerEvents'
@@ -27,12 +29,24 @@ import { RotationGizmo } from '@babylonjs/core/Gizmos/rotationGizmo'
 import { PositionGizmo } from '@babylonjs/core/Gizmos/positionGizmo'
 import { ScaleGizmo } from '@babylonjs/core/Gizmos/scaleGizmo'
 import { UtilityLayerRenderer } from '@babylonjs/core/Rendering/utilityLayerRenderer'
-import { SceneLoader } from '@babylonjs/core/Loading/sceneLoader'
-import '@babylonjs/loaders/SPLAT'
+import { ImportMeshAsync } from '@babylonjs/core/Loading/sceneLoader'
+import { registerBuiltInLoaders } from "@babylonjs/loaders/dynamic";
 import { useAppStore } from '@/stores/appStore'
 import { useSceneStore } from '@/stores/sceneStore'
 import { useEditorStore, type GizmoType, type Transform } from '@/stores/editorStore'
 import type { ColmapPreviewData, CameraPreview, Point3D } from '@/services/BackendApi'
+import { initViewCube, disposeViewCube, setViewCubeVisible } from '@/composables/useViewCube'
+
+registerBuiltInLoaders();  
+// Types for multi-view capture
+export interface CapturedView {
+  filename: string
+  dataUrl: string  // base64 PNG data URL
+  width: number
+  height: number
+  transformMatrix: number[]  // 4x4 combined view*projection matrix as flat array
+  cameraPosition: { x: number; y: number; z: number }
+}
 
 let engine: Engine | null = null
 let scene: Scene | null = null
@@ -43,7 +57,8 @@ let debugMesh: any = null
 
 // Multi-splat storage - keyed by object ID
 const splats = new Map<string, GaussianSplattingMesh>()
-const originalBlobs = new Map<string, Blob>()
+const workingBlobs = new Map<string, Blob>() // Current working state (updated by operations)
+const originalBlobs = new Map<string, Blob>() // Pristine original files for restore
 const originalFileNames = new Map<string, string>()
 const positionCaches = new Map<string, Float32Array>()
 const splatCounts = new Map<string, number>()
@@ -62,6 +77,9 @@ let scaleGizmo: ScaleGizmo | null = null
 
 // Transform snapshot for undo/redo (captured on drag start)
 let transformBeforeDrag: Transform | null = null
+
+// Current splat bounding radius for dynamic zoom speed
+let currentSplatRadius = 10
 
 // Clipping sphere
 let clipSphereMesh: LinesMesh | null = null
@@ -94,6 +112,9 @@ const cameraVelocity = {
   rollVel: 0,    // Q/E
 }
 
+// Y-flip prompt state - set when a user imports a PLY/SPZ file
+const pendingYFlipObjectId = ref<string | null>(null)
+
 // Track which keys are currently pressed
 const keysPressed = {
   forward: false,
@@ -122,7 +143,7 @@ export function useBabylon() {
   function getActiveBlob(): Blob | null {
     const id = editorStore.activeObjectId
     if (!id) return null
-    return originalBlobs.get(id) || null
+    return workingBlobs.get(id) || null
   }
 
   function getActiveFileName(): string | null {
@@ -150,17 +171,22 @@ export function useBabylon() {
   }
 
   function initScene(canvas: HTMLCanvasElement) {
-    // Create engine with performance options
+    // Create engine - using Babylon sandbox settings for proper splat rendering
     engine = new Engine(canvas, true, {
-      preserveDrawingBuffer: false,  // Better performance
+      useHighPrecisionMatrix: true,
+      premultipliedAlpha: false,
+      preserveDrawingBuffer: true,
+      antialias: true,
       stencil: false,
-      antialias: false,  // Disable for splat rendering (not needed)
       powerPreference: 'high-performance'
     })
 
     // Create scene with optimizations
     scene = new Scene(engine)
     scene.clearColor = new Color4(0.051, 0.051, 0.071, 1) // #0D0D12
+    
+    // Critical for gaussian splat rendering - prevents incorrect culling
+    scene.skipFrustumClipping = true
     
     // Performance optimizations
     scene.skipPointerMovePicking = true
@@ -180,11 +206,27 @@ export function useBabylon() {
     )
     orbitCamera.minZ = 0.01
     orbitCamera.maxZ = 500
-    orbitCamera.wheelPrecision = 50
+    orbitCamera.wheelPrecision = 50 // Base value, will be updated dynamically
     orbitCamera.panningSensibility = 500
     orbitCamera.lowerRadiusLimit = 0.5
     orbitCamera.upperRadiusLimit = 200
     orbitCamera.attachControl(canvas, true)
+    
+    // Dynamic wheel precision - zoom faster when far, slower when close relative to splat size
+    orbitCamera.onAfterCheckInputsObservable.add(() => {
+      const radius = orbitCamera!.radius
+      const splatSize = currentSplatRadius || 10
+      
+      // Ratio of camera distance to splat size
+      // When far (ratio > 3), zoom fast; when close (ratio < 0.5), zoom slow
+      const distanceRatio = radius / splatSize
+      
+      // wheelPrecision inversely proportional to distance ratio
+      // At ratio 0.1 (very close): precision ~100 (slow, precise)
+      // At ratio 1.0 (splat radius away): precision ~10  
+      // At ratio 5.0 (far away): precision ~2 (very fast)
+      orbitCamera!.wheelPrecision = 10 / Math.max(distanceRatio, 0.1)
+    })
     
     // ============================================
     // FLY CAMERA (6DOF drone mode)
@@ -385,8 +427,27 @@ export function useBabylon() {
       scene?.render()
     })
 
+    // Add inspector keyboard shortcut (Ctrl+Shift+I or Cmd+Shift+I)
+    window.addEventListener('keydown', (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key === 'I') {
+        event.preventDefault()
+        if (scene) {
+          if (scene.debugLayer.isVisible()) {
+            scene.debugLayer.hide()
+          } else {
+            scene.debugLayer.show({
+              embedMode: true,
+              handleResize: true,
+              overlay: true
+            })
+          }
+        }
+      }
+    })
+
     isReady.value = true
     console.log('[Babylon] Scene initialized with performance optimizations')
+    console.log('[Babylon] Press Ctrl+Shift+I to toggle inspector')
 
     // Watch for file changes
     watch(() => appStore.currentFile, async (file, oldFile) => {
@@ -586,6 +647,9 @@ export function useBabylon() {
     // Create selection brush
     createSelectionBrush()
 
+    // Create view cube (camera orientation gizmo)
+    initViewCube(scene!, engine!)
+
     console.log('[Babylon] Editor helpers initialized')
   }
 
@@ -726,6 +790,15 @@ export function useBabylon() {
 
     // Helper to capture transform before drag starts
     const captureTransformBeforeDrag = () => {
+      // Disable camera controls during gizmo drag to prevent camera movement
+      if (scene) {
+        const canvas = scene.getEngine().getRenderingCanvas()
+        if (canvas) {
+          if (orbitCamera) orbitCamera.detachControl()
+          if (flyCamera) flyCamera.detachControl()
+        }
+      }
+      
       if (hasSelection) {
         captureSelectionProxyTransform()
       } else {
@@ -742,6 +815,19 @@ export function useBabylon() {
 
     // Helper to sync transform and create undo command / apply selection transform
     const syncAndCreateCommand = async () => {
+      // Re-enable camera controls after gizmo drag
+      if (scene) {
+        const canvas = scene.getEngine().getRenderingCanvas()
+        if (canvas) {
+          const activeCamera = scene.activeCamera
+          if (activeCamera === orbitCamera && orbitCamera) {
+            orbitCamera.attachControl(canvas, true)
+          } else if (activeCamera === flyCamera && flyCamera) {
+            flyCamera.attachControl(canvas, true)
+          }
+        }
+      }
+      
       if (hasSelection) {
         // Apply transform to selected splats
         await applySelectionProxyTransform()
@@ -814,6 +900,10 @@ export function useBabylon() {
     console.log('[Babylon] Gizmo space updated, local:', useLocalSpace)
   }
 
+  /**
+   * Sync the current mesh transform to the editor store.
+   * This reads the actual Vector3 values from the Babylon mesh.
+   */
   function syncTransformToStore() {
     const currentSplat = getActiveSplat()
     if (!currentSplat) return
@@ -831,6 +921,28 @@ export function useBabylon() {
       },
       scale: { x: scl.x, y: scl.y, z: scl.z }
     })
+  }
+
+  /**
+   * Get the current transform directly from the mesh (source of truth)
+   */
+  function getMeshTransform(): Transform | null {
+    const currentSplat = getActiveSplat()
+    if (!currentSplat) return null
+
+    const pos = currentSplat.position
+    const rot = currentSplat.rotation
+    const scl = currentSplat.scaling
+
+    return {
+      position: { x: pos.x, y: pos.y, z: pos.z },
+      rotation: { 
+        x: rot.x * (180 / Math.PI), 
+        y: rot.y * (180 / Math.PI), 
+        z: rot.z * (180 / Math.PI) 
+      },
+      scale: { x: scl.x, y: scl.y, z: scl.z }
+    }
   }
 
   function applySplatTransform(position?: { x: number; y: number; z: number }, rotation?: { x: number; y: number; z: number }, scale?: { x: number; y: number; z: number }) {
@@ -965,7 +1077,32 @@ export function useBabylon() {
     if (utilityLayer && !clipSphereGizmo) {
       clipSphereGizmo = new PositionGizmo(utilityLayer)
       clipSphereGizmo.scaleRatio = 0.75
+      
+      // Disable camera controls during drag
+      clipSphereGizmo.onDragStartObservable.add(() => {
+        if (scene) {
+          const canvas = scene.getEngine().getRenderingCanvas()
+          if (canvas) {
+            if (orbitCamera) orbitCamera.detachControl()
+            if (flyCamera) flyCamera.detachControl()
+          }
+        }
+      })
+      
       clipSphereGizmo.onDragEndObservable.add(() => {
+        // Re-enable camera controls
+        if (scene) {
+          const canvas = scene.getEngine().getRenderingCanvas()
+          if (canvas) {
+            const activeCamera = scene.activeCamera
+            if (activeCamera === orbitCamera && orbitCamera) {
+              orbitCamera.attachControl(canvas, true)
+            } else if (activeCamera === flyCamera && flyCamera) {
+              flyCamera.attachControl(canvas, true)
+            }
+          }
+        }
+        
         if (clipSphereMesh) {
           // Use absolutePosition to get world position
           const absPos = clipSphereMesh.absolutePosition
@@ -1070,7 +1207,32 @@ export function useBabylon() {
     if (utilityLayer && !clipBoxGizmo) {
       clipBoxGizmo = new PositionGizmo(utilityLayer)
       clipBoxGizmo.scaleRatio = 0.75
+      
+      // Disable camera controls during drag
+      clipBoxGizmo.onDragStartObservable.add(() => {
+        if (scene) {
+          const canvas = scene.getEngine().getRenderingCanvas()
+          if (canvas) {
+            if (orbitCamera) orbitCamera.detachControl()
+            if (flyCamera) flyCamera.detachControl()
+          }
+        }
+      })
+      
       clipBoxGizmo.onDragEndObservable.add(() => {
+        // Re-enable camera controls
+        if (scene) {
+          const canvas = scene.getEngine().getRenderingCanvas()
+          if (canvas) {
+            const activeCamera = scene.activeCamera
+            if (activeCamera === orbitCamera && orbitCamera) {
+              orbitCamera.attachControl(canvas, true)
+            } else if (activeCamera === flyCamera && flyCamera) {
+              flyCamera.attachControl(canvas, true)
+            }
+          }
+        }
+        
         if (clipBoxMesh) {
           const absPos = clipBoxMesh.absolutePosition
           console.log('[Babylon] Clip box dragged to:', absPos.x, absPos.y, absPos.z)
@@ -1129,6 +1291,7 @@ export function useBabylon() {
     // Calculate half extents for AABB test
     let localCenter = { x: center.x, y: center.y, z: center.z }
     let localHalfSize = { x: size.x * 0.5, y: size.y * 0.5, z: size.z * 0.5 }
+    let applyYNegation = false  // Whether to negate Y when reading file data
 
     if (currentSplat) {
       const meshPos = currentSplat.position
@@ -1169,15 +1332,24 @@ export function useBabylon() {
         }
         
         console.log('[Babylon] Mesh has transform, converted clip box from world to local')
+        
+        // If mesh has negative Y scale, the local center is already in flipped space
+        applyYNegation = meshScale.y >= 0
       } else {
+        // Mesh at identity: Babylon applies Y negation during PLY load
+        applyYNegation = true
         console.log('[Babylon] Mesh at identity transform, using world coordinates directly')
       }
+    } else {
+      // No mesh found, assume Y negation needed
+      applyYNegation = true
     }
 
     console.log('[Babylon] Applying clip box:')
     console.log('  World center:', center.x, center.y, center.z)
     console.log('  Local center:', localCenter.x, localCenter.y, localCenter.z)
     console.log('  Half size:', localHalfSize.x, localHalfSize.y, localHalfSize.z)
+    console.log('  Apply Y negation:', applyYNegation)
 
     try {
       // Read the original file
@@ -1188,9 +1360,9 @@ export function useBabylon() {
       const header = new TextDecoder().decode(uint8.slice(0, 100))
       
       if (header.startsWith('ply')) {
-        return await clipPlyFileBox(uint8, localCenter, localHalfSize)
+        return await clipPlyFileBox(uint8, localCenter, localHalfSize, applyYNegation)
       } else {
-        return await clipSplatFileBox(uint8, localCenter, localHalfSize)
+        return await clipSplatFileBox(uint8, localCenter, localHalfSize, applyYNegation)
       }
     } catch (e) {
       console.error('[Babylon] Failed to apply clip box:', e)
@@ -1201,7 +1373,8 @@ export function useBabylon() {
   async function clipPlyFileBox(
     data: Uint8Array, 
     center: { x: number; y: number; z: number },
-    halfSize: { x: number; y: number; z: number }
+    halfSize: { x: number; y: number; z: number },
+    applyYNegation: boolean
   ): Promise<{ originalCount: number; clippedCount: number }> {
     // Parse PLY header
     const headerEnd = findPlyHeaderEnd(data)
@@ -1244,7 +1417,8 @@ export function useBabylon() {
     for (let i = 0; i < originalCount; i++) {
       const offset = i * vertexSize
       const x = dataView.getFloat32(offset + xProp.offset, true)
-      const y = -dataView.getFloat32(offset + yProp.offset, true)  // Negated Y for Babylon
+      const rawY = dataView.getFloat32(offset + yProp.offset, true)
+      const y = applyYNegation ? -rawY : rawY
       const z = dataView.getFloat32(offset + zProp.offset, true)
       
       if (x >= minX && x <= maxX && y >= minY && y <= maxY && z >= minZ && z <= maxZ) {
@@ -1274,11 +1448,23 @@ export function useBabylon() {
 
     // Load the clipped file
     const clippedBlob = new Blob([newFile], { type: 'application/octet-stream' })
-    const url = URL.createObjectURL(clippedBlob)
     
+    // Update the working file
+    const activeId = editorStore.activeObjectId
+    if (activeId) {
+      const fileName = getActiveFileName() || 'clipped.ply'
+      storeOriginalFile(activeId, clippedBlob, fileName)
+    }
+    
+    const url = URL.createObjectURL(clippedBlob)
     const fileName = getActiveFileName() || 'clipped.ply'
     await loadSplat(url, fileName, false, true)
     URL.revokeObjectURL(url)
+
+    // CRITICAL: Update position cache after crop so brush tool stays in sync
+    if (activeId) {
+      await cacheSplatPositions(activeId)
+    }
 
     return { originalCount, clippedCount }
   }
@@ -1286,7 +1472,8 @@ export function useBabylon() {
   async function clipSplatFileBox(
     data: Uint8Array,
     center: { x: number; y: number; z: number },
-    halfSize: { x: number; y: number; z: number }
+    halfSize: { x: number; y: number; z: number },
+    applyYNegation: boolean
   ): Promise<{ originalCount: number; clippedCount: number }> {
     const bytesPerSplat = 32
     const originalCount = Math.floor(data.length / bytesPerSplat)
@@ -1304,7 +1491,8 @@ export function useBabylon() {
     for (let i = 0; i < originalCount; i++) {
       const offset = i * bytesPerSplat
       const x = dataView.getFloat32(offset, true)
-      const y = -dataView.getFloat32(offset + 4, true)  // Negated Y
+      const rawY = dataView.getFloat32(offset + 4, true)
+      const y = applyYNegation ? -rawY : rawY
       const z = dataView.getFloat32(offset + 8, true)
       
       if (x >= minX && x <= maxX && y >= minY && y <= maxY && z >= minZ && z <= maxZ) {
@@ -1324,30 +1512,84 @@ export function useBabylon() {
     }
 
     const clippedBlob = new Blob([newFile], { type: 'application/octet-stream' })
-    const url = URL.createObjectURL(clippedBlob)
     
+    // Update the working file
+    const activeId = editorStore.activeObjectId
+    if (activeId) {
+      const fileName = getActiveFileName() || 'clipped.splat'
+      storeOriginalFile(activeId, clippedBlob, fileName)
+    }
+    
+    const url = URL.createObjectURL(clippedBlob)
     const fileName = getActiveFileName() || 'clipped.splat'
     await loadSplat(url, fileName, false, true)
     URL.revokeObjectURL(url)
+
+    // CRITICAL: Update position cache after crop so brush tool stays in sync
+    if (activeId) {
+      await cacheSplatPositions(activeId)
+    }
 
     return { originalCount, clippedCount }
   }
 
   function storeOriginalFile(id: string, blob: Blob, name: string) {
-    originalBlobs.set(id, blob)
+    workingBlobs.set(id, blob)
     originalFileNames.set(id, name)
-    console.log('[Babylon] Original file stored for', id, ':', name, blob.size, 'bytes')
+    // Store pristine original blob only if we don't have one yet (first load)
+    if (!originalBlobs.has(id)) {
+      originalBlobs.set(id, blob)
+      console.log('[Babylon] Pristine original file stored for', id, ':', name, blob.size, 'bytes')
+    }
+    console.log('[Babylon] Working file stored for', id, ':', name, blob.size, 'bytes')
   }
 
+  /**
+   * Get the current working file (with all modifications like crops, deletions, etc.)
+   * NOTE: Despite the name "getOriginalFile", this returns the WORKING blob, not the pristine original.
+   * For the pristine original, use originalBlobs.get(id) directly.
+   */
   function getOriginalFile(id?: string): { blob: Blob; name: string } | null {
     const targetId = id || editorStore.activeObjectId
     if (!targetId) return null
-    const blob = originalBlobs.get(targetId)
+    const blob = workingBlobs.get(targetId)
     const name = originalFileNames.get(targetId)
     if (blob && name) {
       return { blob, name }
     }
     return null
+  }
+
+  async function restoreToOriginal(): Promise<boolean> {
+    const activeId = editorStore.activeObjectId
+    if (!activeId) {
+      console.error('[Babylon] No active object to restore')
+      return false
+    }
+
+    const pristineBlob = originalBlobs.get(activeId)
+    const originalName = originalFileNames.get(activeId)
+    
+    if (!pristineBlob || !originalName) {
+      console.error('[Babylon] No original file found to restore')
+      return false
+    }
+
+    console.log('[Babylon] Restoring to original:', originalName, pristineBlob.size, 'bytes')
+
+    // Restore the working blob to the pristine original
+    workingBlobs.set(activeId, pristineBlob)
+
+    // Reload the splat from the pristine original blob
+    const url = URL.createObjectURL(pristineBlob)
+    await loadSplat(url, originalName, false, true)
+    URL.revokeObjectURL(url)
+
+    // CRITICAL: Update position cache after restore so brush tool stays in sync
+    await cacheSplatPositions(activeId)
+
+    console.log('[Babylon] Restored to original successfully')
+    return true
   }
 
   async function applyClipSphere(): Promise<{ originalCount: number; clippedCount: number } | null> {
@@ -1374,6 +1616,7 @@ export function useBabylon() {
     
     let localCenter = { x: center.x, y: center.y, z: center.z }
     let localRadius = radius
+    let applyYNegation = false  // Whether to negate Y when reading file data
 
     if (currentSplat) {
       const meshPos = currentSplat.position
@@ -1413,9 +1656,18 @@ export function useBabylon() {
         }
         
         console.log('[Babylon] Mesh has transform, converted clip center from world to local')
+        
+        // If mesh has negative Y scale, the local center is already in flipped space
+        // So we should NOT apply Y negation when reading file data
+        applyYNegation = meshScale.y >= 0
       } else {
+        // Mesh at identity: Babylon applies Y negation during PLY load, so we need to match it
+        applyYNegation = true
         console.log('[Babylon] Mesh at identity transform, using world coordinates directly')
       }
+    } else {
+      // No mesh found, assume Y negation needed
+      applyYNegation = true
     }
 
     const radiusSq = localRadius * localRadius
@@ -1424,6 +1676,7 @@ export function useBabylon() {
     console.log('  World center:', center.x, center.y, center.z)
     console.log('  Local center:', localCenter.x, localCenter.y, localCenter.z)
     console.log('  Radius:', localRadius)
+    console.log('  Apply Y negation:', applyYNegation)
 
     try {
       // Read the original file
@@ -1435,10 +1688,10 @@ export function useBabylon() {
       
       if (header.startsWith('ply')) {
         // PLY format
-        return await clipPlyFile(uint8, localCenter, radiusSq)
+        return await clipPlyFile(uint8, localCenter, radiusSq, applyYNegation)
       } else {
         // Assume .splat format (32 bytes per splat)
-        return await clipSplatFile(uint8, localCenter, radiusSq)
+        return await clipSplatFile(uint8, localCenter, radiusSq, applyYNegation)
       }
     } catch (e) {
       console.error('[Babylon] Failed to apply clip sphere:', e)
@@ -1449,7 +1702,8 @@ export function useBabylon() {
   async function clipPlyFile(
     data: Uint8Array, 
     center: { x: number; y: number; z: number },
-    radiusSq: number
+    radiusSq: number,
+    applyYNegation: boolean
   ): Promise<{ originalCount: number; clippedCount: number }> {
     // Parse PLY header
     const headerEnd = findPlyHeaderEnd(data)
@@ -1486,9 +1740,9 @@ export function useBabylon() {
       const sampleOffset = 0
       const rawY = dataView.getFloat32(sampleOffset + yProp.offset, true)
       const sampleX = dataView.getFloat32(sampleOffset + xProp.offset, true)
-      const sampleY = -rawY  // Negated Y as used in clipping
+      const sampleY = applyYNegation ? -rawY : rawY
       const sampleZ = dataView.getFloat32(sampleOffset + zProp.offset, true)
-      console.log('[Babylon] PLY first vertex - raw Y:', rawY, '-> transformed:', sampleX, sampleY, sampleZ)
+      console.log('[Babylon] PLY first vertex - raw Y:', rawY, '-> transformed:', sampleX, sampleY, sampleZ, '(Y negation:', applyYNegation, ')')
       
       // Find bounding box of all vertices (with Y negation)
       let minX = Infinity, minY = Infinity, minZ = Infinity
@@ -1496,7 +1750,8 @@ export function useBabylon() {
       for (let i = 0; i < Math.min(originalCount, 1000); i++) {
         const offset = i * vertexSize
         const x = dataView.getFloat32(offset + xProp.offset, true)
-        const y = -dataView.getFloat32(offset + yProp.offset, true)  // Negated
+        const rawY = dataView.getFloat32(offset + yProp.offset, true)
+        const y = applyYNegation ? -rawY : rawY
         const z = dataView.getFloat32(offset + zProp.offset, true)
         minX = Math.min(minX, x); maxX = Math.max(maxX, x)
         minY = Math.min(minY, y); maxY = Math.max(maxY, y)
@@ -1512,14 +1767,14 @@ export function useBabylon() {
     // First pass: count vertices inside sphere
     // NOTE: Babylon.js GaussianSplattingMesh may transform PLY coordinates when loading
     // Common transforms include negating Y or Z for coordinate system conversion
-    // We need to apply the same transform to match what Babylon displays
+    // We apply Y negation only if the mesh doesn't already have negative Y scale
     const insideIndices: number[] = []
     
     for (let i = 0; i < originalCount; i++) {
       const offset = i * vertexSize
       const x = dataView.getFloat32(offset + xProp.offset, true)
-      // Negate Y to match Babylon's coordinate transform for PLY files
-      const y = -dataView.getFloat32(offset + yProp.offset, true)
+      const rawY = dataView.getFloat32(offset + yProp.offset, true)
+      const y = applyYNegation ? -rawY : rawY
       const z = dataView.getFloat32(offset + zProp.offset, true)
       
       const dx = x - center.x
@@ -1555,11 +1810,23 @@ export function useBabylon() {
 
     // Load the clipped file (mark as internal reload to preserve original)
     const clippedBlob = new Blob([newFile], { type: 'application/octet-stream' })
-    const url = URL.createObjectURL(clippedBlob)
     
+    // Update the working file
+    const activeId = editorStore.activeObjectId
+    if (activeId) {
+      const fileName = getActiveFileName() || 'clipped.ply'
+      storeOriginalFile(activeId, clippedBlob, fileName)
+    }
+    
+    const url = URL.createObjectURL(clippedBlob)
     const fileName = getActiveFileName() || 'clipped.ply'
     await loadSplat(url, fileName, false, true)
     URL.revokeObjectURL(url)
+
+    // CRITICAL: Update position cache after crop so brush tool stays in sync
+    if (activeId) {
+      await cacheSplatPositions(activeId)
+    }
 
     return { originalCount, clippedCount }
   }
@@ -1567,21 +1834,22 @@ export function useBabylon() {
   async function clipSplatFile(
     data: Uint8Array,
     center: { x: number; y: number; z: number },
-    radiusSq: number
+    radiusSq: number,
+    applyYNegation: boolean
   ): Promise<{ originalCount: number; clippedCount: number }> {
     const bytesPerSplat = 32
     const originalCount = Math.floor(data.length / bytesPerSplat)
     const dataView = new DataView(data.buffer, data.byteOffset)
 
     // Find splats inside sphere
-    // NOTE: Apply same Y negation as PLY to match Babylon's display
+    // Apply Y negation only if the mesh doesn't already have negative Y scale
     const insideIndices: number[] = []
     
     for (let i = 0; i < originalCount; i++) {
       const offset = i * bytesPerSplat
       const x = dataView.getFloat32(offset, true)
-      // Negate Y to match Babylon's coordinate transform
-      const y = -dataView.getFloat32(offset + 4, true)
+      const rawY = dataView.getFloat32(offset + 4, true)
+      const y = applyYNegation ? -rawY : rawY
       const z = dataView.getFloat32(offset + 8, true)
       
       const dx = x - center.x
@@ -1608,11 +1876,23 @@ export function useBabylon() {
 
     // Load the clipped file (mark as internal reload to preserve original)
     const clippedBlob = new Blob([newFile], { type: 'application/octet-stream' })
-    const url = URL.createObjectURL(clippedBlob)
     
+    // Update the working file
+    const activeId = editorStore.activeObjectId
+    if (activeId) {
+      const fileName = getActiveFileName() || 'clipped.splat'
+      storeOriginalFile(activeId, clippedBlob, fileName)
+    }
+    
+    const url = URL.createObjectURL(clippedBlob)
     const fileName = getActiveFileName() || 'clipped.splat'
     await loadSplat(url, fileName, false, true)
     URL.revokeObjectURL(url)
+
+    // CRITICAL: Update position cache after crop so brush tool stays in sync
+    if (activeId) {
+      await cacheSplatPositions(activeId)
+    }
 
     return { originalCount, clippedCount }
   }
@@ -1670,41 +1950,90 @@ export function useBabylon() {
    * Bake the current mesh transform into the vertex data and reset mesh to identity.
    * Uses Babylon.js built-in bakeCurrentTransformIntoVertices() method.
    */
-  function bakeTransformToVertices(): boolean {
+  async function bakeTransformToVertices(): Promise<boolean> {
     const currentSplat = getActiveSplat()
     if (!currentSplat) {
       console.error('[Babylon] No splat loaded to bake transform')
       return false
     }
 
-    const meshPos = currentSplat.position
-    const meshRot = currentSplat.rotation
-    const meshScale = currentSplat.scaling
+    const meshPos = currentSplat.position.clone()
+    const meshRot = currentSplat.rotation.clone()
+    const meshScale = currentSplat.scaling.clone()
+    const meshRotQuat = currentSplat.rotationQuaternion?.clone()
 
     // Check if there's any transform to bake
-    const hasTransform = 
-      meshPos.x !== 0 || meshPos.y !== 0 || meshPos.z !== 0 ||
-      meshRot.x !== 0 || meshRot.y !== 0 || meshRot.z !== 0 ||
-      meshScale.x !== 1 || meshScale.y !== 1 || meshScale.z !== 1
+    // NOTE: Ignore Y scale of -1, which is Babylon's coordinate system conversion for PLY files
+    const hasPosition = meshPos.x !== 0 || meshPos.y !== 0 || meshPos.z !== 0
+    const hasRotation = meshRot.x !== 0 || meshRot.y !== 0 || meshRot.z !== 0
+    const hasScale = (meshScale.x !== 1 || meshScale.z !== 1) || (meshScale.y !== 1 && meshScale.y !== -1)
+    const hasTransform = hasPosition || hasRotation || hasScale
 
     if (!hasTransform) {
-      console.log('[Babylon] No transform to bake - mesh already at identity')
+      console.log('[Babylon] No user transform to bake (only coordinate system conversion)')
       return true
     }
 
     console.log('[Babylon] Baking transform into vertices:')
     console.log('  Position:', meshPos.x, meshPos.y, meshPos.z)
-    console.log('  Rotation:', meshRot.x, meshRot.y, meshRot.z)
+    console.log('  Rotation (euler):', meshRot.x, meshRot.y, meshRot.z)
+    console.log('  Rotation (quat):', meshRotQuat)
     console.log('  Scale:', meshScale.x, meshScale.y, meshScale.z)
+    console.log('  Has rotationQuaternion:', !!currentSplat.rotationQuaternion)
 
     try {
       // Use Babylon's built-in method to bake transform into vertex buffers
-      currentSplat.bakeCurrentTransformIntoVertices()
+      try {
+        currentSplat.bakeCurrentTransformIntoVertices()
+        console.log('[Babylon] bakeCurrentTransformIntoVertices succeeded')
+      } catch (bakeError: any) {
+        console.error('[Babylon] bakeCurrentTransformIntoVertices failed:', bakeError?.message || bakeError)
+        throw new Error('Bake failed - splat data must be kept in RAM. This is a bug with the keepInRam plugin option.')
+      }
+      
+      // Explicitly ensure mesh is at identity after baking
+      // CRITICAL: Must set rotationQuaternion to null first, or rotation won't take effect
+      currentSplat.rotationQuaternion = null
+      currentSplat.position = Vector3.Zero()
+      currentSplat.rotation = Vector3.Zero()
+      currentSplat.scaling = new Vector3(1, 1, 1)
+      
+      console.log('[Babylon] After reset - position:', currentSplat.position, 'rotation:', currentSplat.rotation, 'rotationQuaternion:', currentSplat.rotationQuaternion)
       
       // Reset the editor store transform (the mesh transform is now identity)
+      // NOTE: Position cache is rebuilt by exportBakedMeshToWorkingBlob via cacheSplatPositions
       editorStore.resetTransform()
-
+      
+      // Verify mesh state after full reset
       console.log('[Babylon] Transform baked successfully')
+      console.log('  Final mesh state:')
+      console.log('    Position:', currentSplat.position.x, currentSplat.position.y, currentSplat.position.z)
+      console.log('    Rotation:', currentSplat.rotation.x, currentSplat.rotation.y, currentSplat.rotation.z)
+      console.log('    RotationQuaternion:', currentSplat.rotationQuaternion)
+      console.log('    Scale:', currentSplat.scaling.x, currentSplat.scaling.y, currentSplat.scaling.z)
+      console.log('  Store state:')
+      console.log('    Position:', editorStore.splatTransform.position)
+      console.log('    Rotation:', editorStore.splatTransform.rotation)
+      console.log('    Scale:', editorStore.splatTransform.scale)
+      
+      // Force sync to make sure everything is consistent
+      setTimeout(() => {
+        console.log('[Babylon] Checking mesh state 100ms after bake:')
+        console.log('    Position:', currentSplat.position.x, currentSplat.position.y, currentSplat.position.z)
+        console.log('    Rotation:', currentSplat.rotation.x, currentSplat.rotation.y, currentSplat.rotation.z)
+        console.log('    RotationQuaternion:', currentSplat.rotationQuaternion)
+      }, 100)
+      
+      // Export the baked mesh data back to workingBlobs so crop operations use the baked data
+      // This also converts from Babylon space to file convention (Y negation) and re-caches positions
+      const activeId = editorStore.activeObjectId
+      if (activeId) {
+        const success = await exportBakedMeshToWorkingBlob(activeId, currentSplat)
+        if (!success) {
+          console.warn('[Babylon] Failed to export baked data to working blob - crops may use old data')
+        }
+      }
+      
       return true
     } catch (e) {
       console.error('[Babylon] Failed to bake transform:', e)
@@ -1713,10 +2042,129 @@ export function useBabylon() {
   }
 
   /**
+   * Auto-flip Y axis and bake for imported PLY/SPZ files.
+   * Sets scaling.y = 1, rotates Z by 180 degrees, then bakes the transform.
+   */
+  async function autoFlipAndBake(): Promise<boolean> {
+    const objectId = pendingYFlipObjectId.value
+    pendingYFlipObjectId.value = null
+    
+    if (!objectId) {
+      console.warn('[Babylon] No pending Y-flip object')
+      return false
+    }
+
+    const mesh = splats.get(objectId)
+    if (!mesh) {
+      console.warn('[Babylon] Mesh not found for Y-flip:', objectId)
+      return false
+    }
+
+    console.log('[Babylon] Auto-flipping Y axis and baking for', objectId)
+
+    // Negate the -Y scaling (set to +1)
+    mesh.scaling.y = 1
+
+    // Rotate Z by 180 degrees to compensate
+    mesh.rotation.z = Math.PI
+
+    // Sync to the store so bake sees the correct state
+    syncTransformToStore()
+
+    // Bake the transform into vertex data
+    const result = await bakeTransformToVertices()
+    
+    if (result) {
+      console.log('[Babylon] Auto Y-flip and bake completed successfully')
+      // Re-focus camera after transform
+      focusCamera()
+    } else {
+      console.error('[Babylon] Auto Y-flip and bake failed')
+    }
+
+    return result
+  }
+
+  /**
+   * Dismiss the Y-flip prompt without applying
+   */
+  function dismissYFlipPrompt() {
+    pendingYFlipObjectId.value = null
+  }
+
+  /**
+   * Export the current mesh's baked vertex data back to a blob file
+   * This ensures crop/delete operations work on the baked data
+   */
+  async function exportBakedMeshToWorkingBlob(id: string, mesh: GaussianSplattingMesh): Promise<boolean> {
+    try {
+      // Access the internal splat data
+      const splatData = (mesh as any)._splatsData as ArrayBuffer
+      if (!splatData) {
+        console.error('[Babylon] Mesh does not have _splatsData - cannot export baked data')
+        return false
+      }
+
+      const fileName = originalFileNames.get(id)
+      if (!fileName) {
+        console.error('[Babylon] No filename found for', id)
+        return false
+      }
+
+      // Clone the buffer so we don't mutate the live mesh data
+      const cloned = splatData.slice(0)
+      const fView = new Float32Array(cloned)
+      const uView = new Uint8Array(cloned)
+
+      // Convert from Babylon display space back to file convention.
+      // Babylon's loader applies scaling.y = -1 on import, so file convention
+      // has Y opposite to Babylon's internal space after baking.
+      // Internal splat format: 32 bytes per splat
+      //   Bytes 0-11:  Float32 x, y, z  (position)
+      //   Bytes 12-23: Float32 sx, sy, sz (scale)
+      //   Bytes 24-27: Uint8 r, g, b, a  (color)
+      //   Bytes 28-31: Uint8 w, x, y, z  (quaternion, mapped [-1,1] -> [0,255])
+      const bytesPerSplat = 32
+      const floatsPerSplat = bytesPerSplat / 4  // 8
+      const splatCount = cloned.byteLength / bytesPerSplat
+
+      for (let i = 0; i < splatCount; i++) {
+        // Negate position Y (float32 at byte offset 4 = float index 1)
+        fView[i * floatsPerSplat + 1] = -fView[i * floatsPerSplat + 1]
+
+        // Adjust quaternion for Y-axis reflection:
+        // Negate W (byte 28) and Y (byte 30) — mirrors Babylon's own
+        // bakeTransformIntoVertices handling for negative Y scale.
+        // For uint8 mapped from [-1,1] to [0,255]: negate = 255 - byte
+        const byteBase = i * bytesPerSplat
+        uView[byteBase + 28] = 255 - uView[byteBase + 28]  // W
+        uView[byteBase + 30] = 255 - uView[byteBase + 30]  // Y
+      }
+
+      console.log('[Babylon] Converted', splatCount, 'splats from Babylon space to file convention (Y negated)')
+
+      // Create a blob from the corrected data
+      const blob = new Blob([cloned], { type: 'application/octet-stream' })
+      
+      // Update the working blob with the corrected data
+      workingBlobs.set(id, blob)
+      console.log('[Babylon] Exported baked mesh data to working blob:', blob.size, 'bytes')
+
+      // Re-cache positions from the corrected blob so clipping/selection tools stay consistent
+      await cacheSplatPositions(id)
+      
+      return true
+    } catch (e) {
+      console.error('[Babylon] Failed to export baked mesh to blob:', e)
+      return false
+    }
+  }
+
+  /**
    * Center the splat at the origin by computing the bounding box center
    * and offsetting all vertices.
    */
-  function centerAtOrigin(): boolean {
+  async function centerAtOrigin(): Promise<boolean> {
     const currentSplat = getActiveSplat()
     if (!currentSplat) {
       console.error('[Babylon] No splat loaded to center')
@@ -1740,7 +2188,7 @@ export function useBabylon() {
       currentSplat.position.subtractInPlace(center)
       
       // Bake the offset into vertices
-      return bakeTransformToVertices()
+      return await bakeTransformToVertices()
     } catch (e) {
       console.error('[Babylon] Failed to center at origin:', e)
       return false
@@ -2021,9 +2469,9 @@ export function useBabylon() {
    * Called after loading a splat file
    */
   async function cacheSplatPositions(id: string) {
-    const blob = originalBlobs.get(id)
+    const blob = workingBlobs.get(id)
     if (!blob) {
-      console.warn('[Babylon] No original file to cache positions from for', id)
+      console.warn('[Babylon] No working file to cache positions from for', id)
       positionCaches.delete(id)
       splatCounts.delete(id)
       return
@@ -2079,6 +2527,7 @@ export function useBabylon() {
       const offset = i * vertexSize
       const x = dataView.getFloat32(offset + xProp.offset, true)
       // Negate Y to match Babylon's coordinate transform for PLY files
+      // These positions are used in WORLD space by the brush tool
       const y = -dataView.getFloat32(offset + yProp.offset, true)
       const z = dataView.getFloat32(offset + zProp.offset, true)
 
@@ -2102,6 +2551,7 @@ export function useBabylon() {
       const offset = i * bytesPerSplat
       const x = dataView.getFloat32(offset, true)
       // Negate Y to match Babylon's coordinate transform
+      // These positions are used in WORLD space by the brush tool
       const y = -dataView.getFloat32(offset + 4, true)
       const z = dataView.getFloat32(offset + 8, true)
 
@@ -2169,11 +2619,8 @@ export function useBabylon() {
     // Create custom mesh for point cloud
     selectionPointCloud = new Mesh('selectionPointCloud', scene)
     
-    // Parent to splat mesh so positions match the splat's coordinate space
-    const currentSplat = getActiveSplat()
-    if (currentSplat) {
-      selectionPointCloud.parent = currentSplat
-    }
+    // DON'T parent to splat mesh - cached positions are already in world space
+    // Parenting would cause double-transformation and Y inversion
     
     const vertexData = new VertexData()
     vertexData.positions = positions
@@ -2206,7 +2653,7 @@ export function useBabylon() {
    */
   function clearSelectionPointCloud() {
     if (selectionPointCloud) {
-      selectionPointCloud.parent = null  // Unparent before disposing
+      // Point cloud is not parented, so no need to unparent
       selectionPointCloud.dispose()
       selectionPointCloud = null
     }
@@ -2412,11 +2859,7 @@ export function useBabylon() {
     // Create custom mesh for point cloud
     selectionPointCloud = new Mesh('selectionPointCloud', scene)
     
-    // Parent to splat mesh so positions match the splat's coordinate space
-    const currentSplat = getActiveSplat()
-    if (currentSplat) {
-      selectionPointCloud.parent = currentSplat
-    }
+    // DON'T parent to splat mesh - positions are already in world space after transform
     
     const vertexData = new VertexData()
     vertexData.positions = positions
@@ -3060,16 +3503,36 @@ export function useBabylon() {
       const extension = name.split('.').pop()?.toLowerCase() || 'splat'
       const pluginExtension = '.' + extension
       
-      console.log('[Babylon] Loading splat via SceneLoader, extension:', pluginExtension)
+      console.log('[Babylon] Loading splat via ImportMeshAsync, extension:', pluginExtension)
       
-      // Use SceneLoader.ImportMeshAsync for proper format detection (.spz, .ply, .splat, .sog)
+      // Use ImportMeshAsync with pluginOptions to set keepInRam for splat loader
+      // This is required for baking transforms into splat data
       let newSplat: GaussianSplattingMesh
       try {
-        const result = await SceneLoader.ImportMeshAsync('', '', url, scene, undefined, pluginExtension)
-        console.log('[Babylon] SceneLoader result:', result.meshes.length, 'meshes loaded')
+        const result = await ImportMeshAsync(url, scene, {
+          pluginExtension: pluginExtension,
+          pluginOptions: {
+            splat: { keepInRam: true }   
+          }
+        })
+        console.log('[Babylon] ImportMeshAsync result:', result.meshes.length, 'meshes loaded')
+        
+        // Check if splat data is kept in RAM
+        const mesh = result.meshes[0] as any
+        console.log('[Babylon] Mesh has _splatsData:', !!mesh._splatsData, 'type:', typeof mesh._splatsData)
         
         if (result.meshes.length === 0) {
           throw new Error('No meshes loaded from file')
+        }
+        
+        // CRITICAL: Dispose any extra meshes that ImportMeshAsync created beyond the first one
+        // This prevents orphaned meshes from accumulating in the scene
+        if (result.meshes.length > 1) {
+          console.warn(`[Babylon] ImportMeshAsync returned ${result.meshes.length} meshes, disposing ${result.meshes.length - 1} extra meshes`)
+          for (let i = 1; i < result.meshes.length; i++) {
+            console.log('[Babylon] Disposing extra mesh:', result.meshes[i].name)
+            result.meshes[i].dispose()
+          }
         }
         
         // The first mesh should be our GaussianSplattingMesh
@@ -3077,7 +3540,7 @@ export function useBabylon() {
         newSplat.name = name
         console.log('[Babylon] File loaded successfully')
       } catch (loadError) {
-        console.error('[Babylon] SceneLoader failed:', loadError)
+        console.error('[Babylon] ImportMeshAsync failed:', loadError)
         throw loadError
       }
       
@@ -3095,11 +3558,23 @@ export function useBabylon() {
         editorStore.setActiveObject(objectId)
       }
 
-      // Get splat count
-      const splatCount = newSplat.getScene() ? 
-        (newSplat as any)._covariancesATexture?.getSize()?.width || 0 : 0
-
-      console.log('[Babylon] Splat count:', splatCount)
+      // Get actual splat count from mesh (getTotalVertices returns the true vertex count)
+      const splatCount = newSplat.getTotalVertices()
+      console.log('[Babylon] Splat count from getTotalVertices():', splatCount)
+      
+      // Log texture dimensions to understand how splats are stored
+      const textureSize = (newSplat as any)._covariancesATexture?.getSize()
+      if (textureSize) {
+        const texelCount = textureSize.width * textureSize.height
+        console.log('[Babylon] Covariance texture dimensions:', textureSize.width, 'x', textureSize.height, '=', texelCount, 'texels')
+        console.log('[Babylon] Texture utilization:', (splatCount / texelCount * 100).toFixed(1) + '%')
+      }
+      
+      // Also check the internal vertex count
+      const internalCount = (newSplat as any)._vertexCount
+      if (internalCount && internalCount !== splatCount) {
+        console.warn('[Babylon] ⚠️ Vertex count mismatch! getTotalVertices:', splatCount, '_vertexCount:', internalCount)
+      }
 
       // Update scene store based on load type
       if (isInternalReload) {
@@ -3127,8 +3602,35 @@ export function useBabylon() {
       }
 
       // Cache splat positions for selection tool (only for non-preview, non-internal reloads)
-      if (!isPreview && !isInternalReload && originalBlobs.has(objectId)) {
+      if (!isPreview && !isInternalReload && workingBlobs.has(objectId)) {
         await cacheSplatPositions(objectId)
+        
+        // Compare cached count (from original file) vs loaded count (from mesh)
+        const cachedCount = splatCounts.get(objectId)
+        if (cachedCount && cachedCount !== splatCount) {
+          console.warn('[Babylon] ⚠️ SPLAT COUNT MISMATCH!')
+          console.warn('[Babylon]   Original file has:', cachedCount, 'splats')
+          console.warn('[Babylon]   Babylon loaded:', splatCount, 'splats')
+          console.warn('[Babylon]   Missing:', cachedCount - splatCount, 'splats (', ((cachedCount - splatCount) / cachedCount * 100).toFixed(1), '% lost)')
+        } else if (cachedCount) {
+          console.log('[Babylon] ✓ Splat counts match - all', cachedCount, 'splats loaded successfully')
+        }
+      }
+      
+      // Sync the initial mesh transform to the store so UI reflects actual values
+      // This is important because PLY files may have Y scale = -1 from coordinate conversion
+      syncTransformToStore()
+      
+      // Defensive cleanup: ensure no orphaned splat meshes remain in the scene
+      cleanupOrphanedSplats()
+      
+      // Prompt for Y-axis flip on user imports (not previews or internal reloads)
+      // Babylon's loader applies scaling.y = -1 for ALL GS formats (PLY, SPZ, SPLAT)
+      if (!isPreview && !isInternalReload) {
+        if (newSplat.scaling.y < 0) {
+          pendingYFlipObjectId.value = objectId
+          console.log('[Babylon] GS import detected with Y-flip — prompting user')
+        }
       }
       
       return objectId
@@ -3161,6 +3663,7 @@ export function useBabylon() {
     }
     
     // Clean up associated data
+    workingBlobs.delete(id)
     originalBlobs.delete(id)
     originalFileNames.delete(id)
     positionCaches.delete(id)
@@ -3174,6 +3677,11 @@ export function useBabylon() {
       // Set active to next available splat, or null if none
       const remainingIds = Array.from(splats.keys())
       editorStore.setActiveObject(remainingIds.length > 0 ? remainingIds[0] : null)
+      
+      // If we switched to a different splat, sync its transform
+      if (remainingIds.length > 0) {
+        syncTransformToStore()
+      }
     }
   }
 
@@ -3191,6 +3699,7 @@ export function useBabylon() {
     
     // Clear all maps
     splats.clear()
+    workingBlobs.clear()
     originalBlobs.clear()
     originalFileNames.clear()
     positionCaches.clear()
@@ -3203,6 +3712,42 @@ export function useBabylon() {
     // Clear selection-related state
     clearSelectionPointCloud()
     disposeSelectionProxy()
+  }
+
+  /**
+   * Cleanup any orphaned GaussianSplattingMesh instances in the scene
+   * that are not tracked in our splats Map
+   */
+  function cleanupOrphanedSplats() {
+    if (!scene) return
+    
+    const orphans: GaussianSplattingMesh[] = []
+    
+    // Find all GaussianSplattingMesh instances in the scene
+    for (const mesh of scene.meshes) {
+      if (mesh instanceof GaussianSplattingMesh) {
+        // Check if this mesh is tracked in our splats Map
+        let isTracked = false
+        for (const trackedMesh of splats.values()) {
+          if (trackedMesh === mesh) {
+            isTracked = true
+            break
+          }
+        }
+        
+        if (!isTracked) {
+          orphans.push(mesh)
+        }
+      }
+    }
+    
+    if (orphans.length > 0) {
+      console.warn(`[Babylon] Found ${orphans.length} orphaned splat meshes, disposing...`)
+      for (const orphan of orphans) {
+        console.log('[Babylon] Disposing orphaned mesh:', orphan.name)
+        orphan.dispose()
+      }
+    }
   }
 
   /**
@@ -3254,6 +3799,9 @@ export function useBabylon() {
       scene.onPointerObservable.remove(globalPointerObserver)
       globalPointerObserver = null
     }
+    
+    // Dispose view cube
+    disposeViewCube()
     
     clearSplat()
     scene?.dispose()
@@ -3343,6 +3891,8 @@ export function useBabylon() {
           targetPos = boundingInfo.boundingBox.centerWorld.clone()
           const radius = boundingInfo.boundingSphere.radiusWorld
           dist = Math.max(radius * 2.5, 5)
+          // Store for dynamic zoom speed calculation
+          currentSplatRadius = radius
         }
       } catch (e) {
         console.warn('[Babylon] Could not get bounding info, using default focus')
@@ -3481,12 +4031,12 @@ export function useBabylon() {
     // Indices for two triangles (facing the camera)
     vertexData.indices = [0, 2, 1, 0, 3, 2]
     
-    // UVs: map image to corners (flip V for typical image coordinate system)
+    // UVs: map image to corners (corrected for proper orientation)
     vertexData.uvs = [
-      0, 1,  // bottom-left -> image top-left
-      1, 1,  // bottom-right -> image top-right
-      1, 0,  // top-right -> image bottom-right
-      0, 0,  // top-left -> image bottom-left
+      1, 0,  // bottom-left -> image bottom-right
+      0, 0,  // bottom-right -> image bottom-left
+      0, 1,  // top-right -> image top-left
+      1, 1,  // top-left -> image top-right
     ]
     
     vertexData.applyToMesh(imagePlane)
@@ -3644,6 +4194,259 @@ export function useBabylon() {
     return colmapPreviewMeshes.length > 0
   }
 
+  // ============================================
+  // Multi-View Capture for Semantic Selection
+  // ============================================
+
+  /**
+   * Capture multiple views around the scene for semantic segmentation
+   * Creates 8 virtual cameras at 45-degree intervals around the scene center
+   * 
+   * @param resolution Image resolution (default 512x512)
+   * @returns Array of captured views with images and camera matrices
+   */
+  async function captureMultiViewImages(resolution: number = 512): Promise<CapturedView[]> {
+    if (!scene || !engine) {
+      throw new Error('Scene not initialized')
+    }
+
+    const splat = getActiveSplat()
+    if (!splat) {
+      throw new Error('No active splat to capture')
+    }
+
+    // Use the current camera's target and distance instead of bounding box
+    // This captures views from the user's current viewpoint
+    const currentCamera = scene.activeCamera as ArcRotateCamera
+    if (!currentCamera || !currentCamera.target) {
+      throw new Error('No active ArcRotate camera')
+    }
+
+    // Use the current camera's target (where user is looking) and radius (zoom level)
+    const center = currentCamera.target.clone()
+    const cameraDistance = currentCamera.radius
+
+    console.log(`[Babylon] Capturing multi-view images - center: ${center}, distance: ${cameraDistance}`)
+
+    const capturedViews: CapturedView[] = []
+    const numViews = 8
+    const canvas = engine.getRenderingCanvas()
+    if (!canvas) {
+      throw new Error('No rendering canvas')
+    }
+
+    // Store original camera
+    const originalCamera = scene.activeCamera
+
+    // Create a temporary camera for capturing
+    const captureCamera = new ArcRotateCamera(
+      'captureCamera',
+      0,
+      Math.PI * 0.4, // Slightly above horizontal
+      cameraDistance,
+      center,
+      scene
+    )
+    captureCamera.minZ = 0.01
+    captureCamera.maxZ = cameraDistance * 20
+
+    try {
+      for (let i = 0; i < numViews; i++) {
+        // Position camera at 45-degree intervals
+        const angle = (i / numViews) * Math.PI * 2
+        captureCamera.alpha = angle
+        
+        // Vary elevation slightly for views 0, 2, 4, 6 vs 1, 3, 5, 7
+        captureCamera.beta = i % 2 === 0 ? Math.PI * 0.35 : Math.PI * 0.45
+        
+        // Set as active camera
+        scene.activeCamera = captureCamera
+
+        // Force scene update
+        scene.render()
+
+        // Capture screenshot
+        const dataUrl = await Tools.CreateScreenshotAsync(engine, captureCamera, {
+          width: resolution,
+          height: resolution
+        })
+
+        // Get camera matrices and compute combined transform (view * projection)
+        const viewMatrix = captureCamera.getViewMatrix()
+        const projMatrix = captureCamera.getProjectionMatrix()
+        const transformMatrix = viewMatrix.multiply(projMatrix).toArray()
+        const cameraPos = captureCamera.position
+
+        capturedViews.push({
+          filename: `view_${i.toString().padStart(2, '0')}.png`,
+          dataUrl,
+          width: resolution,
+          height: resolution,
+          transformMatrix: transformMatrix as number[],
+          cameraPosition: { x: cameraPos.x, y: cameraPos.y, z: cameraPos.z }
+        })
+
+        console.log(`[Babylon] Captured view ${i + 1}/${numViews}`)
+      }
+    } finally {
+      // Restore original camera
+      scene.activeCamera = originalCamera
+      captureCamera.dispose()
+      
+      // Re-render with original camera
+      scene.render()
+    }
+
+    console.log(`[Babylon] Multi-view capture complete: ${capturedViews.length} views`)
+    return capturedViews
+  }
+
+  /**
+   * Project 2D masks back to 3D splat indices
+   * Uses voting across multiple views - a splat is selected if it appears
+   * inside the mask in at least `threshold` views
+   * 
+   * @param masks Array of mask info with base64 data and camera transform matrix
+   * @param threshold Minimum number of views a splat must be in mask (default: 3)
+   * @returns Set of selected splat indices
+   */
+  async function projectMasksToSplatIndices(
+    masks: Array<{
+      mask_base64: string
+      width: number
+      height: number
+      transformMatrix: number[]
+    }>,
+    threshold: number = 3
+  ): Promise<Set<number>> {
+    if (!scene) {
+      throw new Error('Scene not initialized')
+    }
+
+    const positions = getActivePositions()
+    if (!positions) {
+      throw new Error('No position data available')
+    }
+
+    const splatCount = positions.length / 3
+    const votes = new Uint8Array(splatCount)
+
+    console.log(`[Babylon] Projecting ${masks.length} masks onto ${splatCount} splats`)
+
+    // Process each mask
+    for (const maskInfo of masks) {
+      // Decode mask from base64
+      const maskData = await decodeMaskBase64(maskInfo.mask_base64, maskInfo.width, maskInfo.height)
+      if (!maskData) continue
+
+      // Reconstruct combined transform matrix (view * projection)
+      const transformMatrix = Matrix.FromArray(maskInfo.transformMatrix)
+      const viewport = new Viewport(0, 0, maskInfo.width, maskInfo.height)
+
+      let maskHits = 0
+
+      // Project each splat position and check if inside mask
+      for (let i = 0; i < splatCount; i++) {
+        const pos = new Vector3(
+          positions[i * 3],
+          positions[i * 3 + 1],
+          positions[i * 3 + 2]
+        )
+
+        // Project 3D position to 2D screen coordinates
+        const projected = Vector3.Project(
+          pos,
+          Matrix.Identity(),
+          transformMatrix,
+          viewport
+        )
+
+        // Check if within image bounds
+        const px = Math.floor(projected.x)
+        // Flip Y-axis: Babylon's projection has Y=0 at bottom, but image has Y=0 at top
+        const py = Math.floor(maskInfo.height - 1 - projected.y)
+        
+        if (px >= 0 && px < maskInfo.width && py >= 0 && py < maskInfo.height) {
+          // Check depth - only count if in front of camera (z between 0 and 1 in NDC)
+          if (projected.z > 0 && projected.z < 1) {
+            // Check mask value at this pixel
+            const maskIdx = py * maskInfo.width + px
+            if (maskData[maskIdx] > 0) {
+              votes[i]++
+              maskHits++
+            }
+          }
+        }
+      }
+      
+      console.log(`[Babylon] Mask processed: ${maskHits} splats hit`)
+    }
+
+    // Select splats that meet the vote threshold
+    const selectedIndices = new Set<number>()
+    for (let i = 0; i < splatCount; i++) {
+      if (votes[i] >= threshold) {
+        selectedIndices.add(i)
+      }
+    }
+
+    console.log(`[Babylon] Projection complete: ${selectedIndices.size} splats selected (threshold: ${threshold}+ votes)`)
+    return selectedIndices
+  }
+
+  /**
+   * Toggle Babylon.js inspector for debugging
+   */
+  function toggleInspector() {
+    if (!scene) {
+      console.warn('[Babylon] Scene not initialized')
+      return
+    }
+    
+    if (scene.debugLayer.isVisible()) {
+      scene.debugLayer.hide()
+    } else {
+      scene.debugLayer.show({
+        embedMode: true,
+        handleResize: true,
+        overlay: true
+      })
+    }
+  }
+
+  /**
+   * Decode a base64 PNG mask into a Uint8Array
+   */
+  async function decodeMaskBase64(base64: string, width: number, height: number): Promise<Uint8Array | null> {
+    return new Promise((resolve) => {
+      const img = new Image()
+      img.onload = () => {
+        const canvas = document.createElement('canvas')
+        canvas.width = width
+        canvas.height = height
+        const ctx = canvas.getContext('2d')
+        if (!ctx) {
+          resolve(null)
+          return
+        }
+
+        ctx.drawImage(img, 0, 0)
+        const imageData = ctx.getImageData(0, 0, width, height)
+        
+        // Extract single channel (grayscale mask)
+        const mask = new Uint8Array(width * height)
+        for (let i = 0; i < mask.length; i++) {
+          // Use red channel (all channels should be same for grayscale)
+          mask[i] = imageData.data[i * 4]
+        }
+        
+        resolve(mask)
+      }
+      img.onerror = () => resolve(null)
+      img.src = base64.startsWith('data:') ? base64 : `data:image/png;base64,${base64}`
+    })
+  }
+
   return {
     isReady,
     initScene,
@@ -3658,9 +4461,11 @@ export function useBabylon() {
     isSceneReady,
     focusCamera,
     switchCameraMode,
+    toggleInspector,
     // Multi-splat management
     removeSplat,
     clearAllSplats,
+    cleanupOrphanedSplats,
     setSplatVisibility,
     toggleSplatVisibility,
     // COLMAP preview functions
@@ -3676,6 +4481,7 @@ export function useBabylon() {
     resetSplatTransform,
     rotateSplat90,
     syncTransformToStore,
+    getMeshTransform,
     applyTransformFromHistory,
     // Clipping sphere
     setClipSphereVisible,
@@ -3689,9 +4495,14 @@ export function useBabylon() {
     applyClipBox,
     getOriginalFile,
     storeOriginalFile,
+    restoreToOriginal,
     // Bake transform
     bakeTransformToVertices,
     centerAtOrigin,
+    // Auto Y-flip for PLY/SPZ imports
+    showYFlipPrompt: pendingYFlipObjectId,
+    autoFlipAndBake,
+    dismissYFlipPrompt,
     // Selection
     createSelectionBrush,
     setSelectionBrushVisible,
@@ -3708,6 +4519,11 @@ export function useBabylon() {
     deselectSplatsInBrush,
     paintWithBrush,
     updateBrushFromScreenPosition,
-    deleteSelectedSplats
+    deleteSelectedSplats,
+    // Semantic selection (multi-view capture)
+    captureMultiViewImages,
+    projectMasksToSplatIndices,
+    // View cube (camera orientation gizmo)
+    setViewCubeVisible
   }
 }

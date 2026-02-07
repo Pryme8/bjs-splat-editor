@@ -207,3 +207,21 @@ export function removeJobOwnership(jobId: string): void {
 export function removeJobSubscribers(jobId: string): void {
   jobSubscribers.delete(jobId)
 }
+
+/**
+ * Close all WebSocket connections (for shutdown)
+ */
+export function closeAllConnections(): void {
+  console.log(`[WebSocket] Closing ${allClients.size} connections...`)
+  for (const client of allClients) {
+    try {
+      client.close(1000, 'Server shutting down')
+    } catch (e) {
+      // Ignore errors during shutdown
+    }
+  }
+  allClients.clear()
+  jobSubscribers.clear()
+  clientOwnedJobs.clear()
+  consoleSubscribers.clear()
+}

@@ -7,6 +7,8 @@ import { exec } from 'child_process'
 import { promisify } from 'util'
 import { detectCuda, getCachedCudaInfo, type CudaInfo } from '../services/cuda.js'
 import { isDirectMode } from '../services/jobQueue.js'
+import { checkGsplatAvailable, getGsplatVersion } from '../services/gsplatTrainer.js'
+import { isDockerMode } from '../services/opensplat.js'
 
 const execAsync = promisify(exec)
 const router = Router()
@@ -20,15 +22,18 @@ router.get('/', async (req, res) => {
       colmap: false,
       redis: false,
       opensplat: false,
+      gsplat: false,
       cuda: false
     },
     versions: {
       node: process.version,
       colmap: null as string | null,
-      opensplat: null as string | null
+      opensplat: null as string | null,
+      gsplat: null as string | null
     },
     cuda: null as CudaInfo | null,
-    mode: isDirectMode() ? 'direct' : 'queued'
+    mode: isDirectMode() ? 'direct' : 'queued',
+    opensplatDocker: isDockerMode()
   }
 
   // Check COLMAP
@@ -66,6 +71,16 @@ router.get('/', async (req, res) => {
     health.versions.opensplat = 'installed'
   } catch {
     health.services.opensplat = false
+  }
+
+  // Check gsplat (Python-based trainer)
+  try {
+    health.services.gsplat = await checkGsplatAvailable()
+    if (health.services.gsplat) {
+      health.versions.gsplat = await getGsplatVersion() || 'installed'
+    }
+  } catch {
+    health.services.gsplat = false
   }
 
   // Check CUDA (use cached result if available, otherwise detect)

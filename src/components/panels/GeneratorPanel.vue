@@ -5,14 +5,16 @@ import { useSceneStore } from '@/stores/sceneStore'
 import { useVideoFrameStore } from '@/stores/videoFrameStore'
 import { useGenerator } from '@/composables/useGenerator'
 import { useBabylon } from '@/composables/useBabylon'
-import { SceneTypeLabels, SceneTypeDescriptions, type SceneType } from '@/generator/types'
+import { SceneTypeLabels, SceneTypeDescriptions, type SceneType, TrainerEngineLabels, TrainerEngineDescriptions, type TrainerEngine } from '@/generator/types'
 import VideoFrameModal from '@/components/modals/VideoFrameModal.vue'
+import DragNumberInput from '@/components/common/DragNumberInput.vue'
 
 const generatorStore = useGeneratorStore()
 const sceneStore = useSceneStore()
 const videoFrameStore = useVideoFrameStore()
 const generator = useGenerator()
 const babylon = useBabylon()
+
 
 // Supported video MIME types
 const VIDEO_MIME_TYPES = ['video/mp4', 'video/webm', 'video/quicktime', 'video/x-msvideo']
@@ -49,10 +51,25 @@ const canGenerate = computed(() => {
 
 const generatorModeLabel = computed(() => {
   if (generatorStore.useBackend) {
-    return generatorStore.trainingMode === 'gpu' ? 'GPU (OpenSplat)' : 
-           generatorStore.trainingMode === 'cpu' ? 'CPU (OpenSplat)' : 'Auto'
+    const engine = generatorStore.config.trainerEngine || 'auto'
+    const engineLabel = engine === 'auto' ? '' : ` (${TrainerEngineLabels[engine]})`
+    return generatorStore.trainingMode === 'gpu' ? `GPU${engineLabel}` : 
+           generatorStore.trainingMode === 'cpu' ? `CPU${engineLabel}` : `Auto${engineLabel}`
   }
   return 'Browser (WebGPU)'
+})
+
+// Trainer engine options for dropdown
+const trainerEngineOptions = computed(() => {
+  return Object.entries(TrainerEngineLabels).map(([value, label]) => ({
+    value: value as TrainerEngine,
+    title: label
+  }))
+})
+
+const currentTrainerHint = computed(() => {
+  const engine = generatorStore.config.trainerEngine || 'auto'
+  return TrainerEngineDescriptions[engine]
 })
 
 // Scene type options for dropdown
@@ -67,6 +84,14 @@ const currentSceneTypeHint = computed(() => {
   const sceneType = generatorStore.config.sceneType || 'auto'
   return SceneTypeDescriptions[sceneType]
 })
+
+const resolutionOptions = [
+  { value: 512, title: '512px (Fast)' },
+  { value: 768, title: '768px' },
+  { value: 1024, title: '1024px (Default)' },
+  { value: 1536, title: '1536px' },
+  { value: 2048, title: '2048px (Best)' }
+]
 
 async function recheckBackend() {
   checkingBackend.value = true
@@ -251,14 +276,14 @@ async function loadResultToScene() {
   await generator.loadResultToScene('Generated Splats')
 }
 
-function downloadPly() {
+async function downloadPly() {
   const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '')
-  generator.downloadAsPly(`splats-${timestamp}.ply`)
+  await generator.downloadAsPly(`splats-${timestamp}.ply`)
 }
 
-function downloadSplat() {
+async function downloadSplat() {
   const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '')
-  generator.downloadAsSplat(`splats-${timestamp}.splat`)
+  await generator.downloadAsSplat(`splats-${timestamp}.splat`)
 }
 
 // Check if there are existing splats before generating
@@ -388,6 +413,27 @@ function clearAndGenerate() {
           </p>
         </div>
 
+        <!-- Trainer Engine Selection -->
+        <div v-if="generatorStore.backendAvailable" class="section">
+          <div class="section-header">Trainer Engine</div>
+          
+          <v-select
+            :model-value="generatorStore.config.trainerEngine || 'auto'"
+            @update:model-value="v => generatorStore.updateConfig({ trainerEngine: v })"
+            :items="trainerEngineOptions"
+            item-value="value"
+            item-title="title"
+            density="compact"
+            variant="outlined"
+            hide-details
+            class="scene-type-select"
+          />
+
+          <p class="mode-hint">
+            {{ currentTrainerHint }}
+          </p>
+        </div>
+
         <!-- Scene Type Selection -->
         <div v-if="generatorStore.backendAvailable" class="section">
           <div class="section-header">Scene Type</div>
@@ -497,16 +543,30 @@ function clearAndGenerate() {
           
           <div class="setting-row">
             <span class="setting-label">Iterations</span>
-            <v-text-field
+            <DragNumberInput
               :model-value="generatorStore.config.iterations"
-              @update:model-value="v => generatorStore.updateConfig({ iterations: Number(v) })"
-              type="number"
+              @update:model-value="v => generatorStore.updateConfig({ iterations: v })"
               :min="1000"
               :max="100000"
-              :step="5000"
-              hide-details
-              density="compact"
+              :step="1000"
+              :drag-sensitivity="1"
               class="setting-input mono-input"
+              :disabled="generatorStore.isGenerating"
+            />
+          </div>
+
+          <div class="setting-row">
+            <span class="setting-label">Resolution</span>
+            <v-select
+              :model-value="generatorStore.config.resolution"
+              @update:model-value="v => generatorStore.updateConfig({ resolution: v })"
+              :items="resolutionOptions"
+              item-value="value"
+              item-title="title"
+              density="compact"
+              variant="outlined"
+              hide-details
+              class="setting-input"
               :disabled="generatorStore.isGenerating"
             />
           </div>
@@ -676,6 +736,17 @@ function clearAndGenerate() {
             <v-chip size="x-small" :color="progressColor" class="ml-2">
               {{ stageLabel }}
             </v-chip>
+            <!-- Device Indicator -->
+            <v-tooltip v-if="generatorStore.currentDeviceType" location="top">
+              <template #activator="{ props }">
+                <span 
+                  v-bind="props"
+                  class="device-dot"
+                  :class="generatorStore.currentDeviceType === 'gpu' ? 'device-dot--gpu' : 'device-dot--cpu'"
+                />
+              </template>
+              <span>{{ generatorStore.currentDeviceName || (generatorStore.currentDeviceType === 'gpu' ? 'GPU' : 'CPU') }}</span>
+            </v-tooltip>
           </div>
 
           <v-progress-linear
@@ -927,6 +998,26 @@ function clearAndGenerate() {
   letter-spacing: 0.5px;
   color: #9898A8;
   margin-bottom: 12px;
+}
+
+.device-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-left: 8px;
+  cursor: help;
+  flex-shrink: 0;
+  
+  &--gpu {
+    background-color: #4CAF50;
+    box-shadow: 0 0 6px rgba(76, 175, 80, 0.8);
+  }
+  
+  &--cpu {
+    background-color: #FF5252;
+    box-shadow: 0 0 6px rgba(255, 82, 82, 0.8);
+  }
 }
 
 .subsection-header {

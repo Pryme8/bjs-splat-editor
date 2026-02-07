@@ -12,6 +12,7 @@ import { spawn } from 'child_process'
 import path from 'path'
 import fs from 'fs/promises'
 import { fileURLToPath } from 'url'
+import { registerProcess } from './processTracker.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -41,6 +42,8 @@ export interface DepthSummary {
   total_images: number
   successful: number
   images: DepthResult[]
+  device_type?: 'gpu' | 'cpu'
+  device_name?: string
 }
 
 /**
@@ -116,7 +119,7 @@ export async function estimateDepth(
   inputDir: string,
   outputDir: string,
   config: DepthEstimationConfig = {},
-  onOutput?: (line: string) => void,
+  onOutput?: (line: string, deviceInfo?: { deviceType?: 'gpu' | 'cpu', deviceName?: string }) => void,
   jobId?: string
 ): Promise<DepthSummary> {
   const {
@@ -146,8 +149,14 @@ export async function estimateDepth(
       cwd: path.dirname(DEPTH_SCRIPT)
     })
     
+    // Register process for cleanup on job cancellation
+    if (jobId) {
+      registerProcess(jobId, proc)
+    }
+    
     let stdout = ''
     let stderr = ''
+    let deviceInfo: { deviceType?: 'gpu' | 'cpu', deviceName?: string } = {}
     
     proc.stdout.on('data', (data) => {
       const text = data.toString()
@@ -166,9 +175,35 @@ export async function estimateDepth(
       const text = data.toString()
       stderr += text
       
+      // Capture device info from stderr
+      const lines = text.split('\n')
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (trimmed.includes('Using CUDA GPU:')) {
+          deviceInfo.deviceType = 'gpu'
+          const match = trimmed.match(/Using CUDA GPU:\s*(.+)/)
+          if (match) deviceInfo.deviceName = match[1].trim()
+          console.log(`[DepthEstimation] Device detected: ${deviceInfo.deviceType} - ${deviceInfo.deviceName}`)
+          // Send device info immediately via callback
+          if (onOutput) onOutput('Device detected', deviceInfo)
+        } else if (trimmed.includes('Using Apple Metal GPU')) {
+          deviceInfo.deviceType = 'gpu'
+          deviceInfo.deviceName = 'Apple Metal'
+          console.log(`[DepthEstimation] Device detected: ${deviceInfo.deviceType} - ${deviceInfo.deviceName}`)
+          // Send device info immediately via callback
+          if (onOutput) onOutput('Device detected', deviceInfo)
+        } else if (trimmed.includes('Using CPU')) {
+          deviceInfo.deviceType = 'cpu'
+          deviceInfo.deviceName = 'CPU'
+          console.log(`[DepthEstimation] Device detected: ${deviceInfo.deviceType} - ${deviceInfo.deviceName}`)
+          // Send device info immediately via callback
+          if (onOutput) onOutput('Device detected', deviceInfo)
+        }
+      }
+      
       // Forward progress messages (tqdm writes to stderr)
       if (onOutput && (text.includes('%') || text.includes('Estimating'))) {
-        onOutput(text.trim())
+        onOutput(text.trim(), deviceInfo)
       }
     })
     
@@ -186,7 +221,14 @@ export async function estimateDepth(
         const jsonLine = lines[lines.length - 1]
         const summary = JSON.parse(jsonLine) as DepthSummary
         
+        // Add device info if not already in summary
+        if (!summary.device_type && deviceInfo.deviceType) {
+          summary.device_type = deviceInfo.deviceType
+          summary.device_name = deviceInfo.deviceName
+        }
+        
         console.log(`[DepthEstimation] Completed: ${summary.successful}/${summary.total_images} images`)
+        console.log(`[DepthEstimation] Device: ${summary.device_type} - ${summary.device_name}`)
         resolve(summary)
       } catch (e) {
         // Try reading summary file

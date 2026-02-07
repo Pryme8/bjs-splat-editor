@@ -11,7 +11,7 @@ import { fileURLToPath } from 'url'
 
 import { createJob, getJob, getAllJobs, cancelJob } from '../services/jobManager.js'
 import { findLatestIntermediate } from '../services/opensplat.js'
-import type { JobConfig, TrainingMode } from '../types/index.js'
+import type { JobConfig, TrainingMode, TrainerEngine } from '../types/index.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const UPLOAD_DIR = path.join(__dirname, '../../data/uploads')
@@ -105,7 +105,9 @@ router.post('/', upload.array('images', 300), async (req, res) => {
       depthFloaterThreshold: req.body.depthFloaterThreshold ? parseFloat(req.body.depthFloaterThreshold) : undefined,
       // AI Enhancement: Learned Features (DISK + LightGlue)
       learnedFeaturesEnabled: req.body.learnedFeaturesEnabled === 'true',
-      learnedFeaturesMaxKeypoints: req.body.learnedFeaturesMaxKeypoints ? parseInt(req.body.learnedFeaturesMaxKeypoints) : undefined
+      learnedFeaturesMaxKeypoints: req.body.learnedFeaturesMaxKeypoints ? parseInt(req.body.learnedFeaturesMaxKeypoints) : undefined,
+      // Trainer engine selection
+      trainerEngine: (req.body.trainerEngine as TrainerEngine) || 'auto'
     }
 
     // Create job

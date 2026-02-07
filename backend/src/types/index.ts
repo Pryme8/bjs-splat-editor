@@ -26,6 +26,8 @@ export type SceneType = 'auto' | 'building360' | 'interior' | 'landscape'
 
 export type QualityPreset = 'fast' | 'medium' | 'high'
 
+export type TrainerEngine = 'opensplat' | 'gsplat' | 'auto'
+
 export type DepthModelSize = 'small' | 'base' | 'large'
 
 // Learned feature matching options
@@ -53,6 +55,8 @@ export interface JobConfig {
   // Learned feature matching options (AI-enhanced)
   learnedFeaturesEnabled?: boolean  // Use DISK + LightGlue instead of SIFT (default: false)
   learnedFeaturesMaxKeypoints?: number  // Max keypoints per image (default: 2048)
+  // Trainer engine selection
+  trainerEngine?: TrainerEngine  // Which splat trainer to use (default: 'auto')
 }
 
 export interface Job {
@@ -70,6 +74,8 @@ export interface Job {
   colmapData?: ColmapResult
 }
 
+export type DeviceType = 'gpu' | 'cpu'
+
 export interface JobProgress {
   jobId: string
   status: JobStatus
@@ -82,6 +88,8 @@ export interface JobProgress {
   splatCount?: number
   intermediateReady?: boolean  // Signals a new intermediate PLY is available
   colmapPreviewReady?: boolean  // Signals COLMAP data is available for preview
+  deviceType?: DeviceType  // Current processing device (GPU or CPU)
+  deviceName?: string  // Device name for tooltip (e.g., "NVIDIA RTX 4090")
 }
 
 export interface Point3D {

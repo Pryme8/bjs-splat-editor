@@ -181,11 +181,14 @@ def process_directory(
             })
     
     # Save summary
+    device = model_dict["device"]
     summary = {
         "model": model_size,
         "total_images": len(images),
         "successful": len([r for r in results if "error" not in r]),
-        "images": results
+        "images": results,
+        "device_type": "gpu" if device.type in ['cuda', 'mps'] else "cpu",
+        "device_name": torch.cuda.get_device_name(0) if device.type == 'cuda' else device.type.upper()
     }
     
     summary_path = output_dir / "depth_summary.json"

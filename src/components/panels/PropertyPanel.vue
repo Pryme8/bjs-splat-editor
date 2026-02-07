@@ -1,47 +1,129 @@
 <script setup lang="ts">
-import { computed, watch } from 'vue'
+import { computed, ref, onMounted, onUnmounted, watch } from 'vue'
 import { useSplatEditor } from '@/composables/useSplatEditor'
+import { useBabylon } from '@/composables/useBabylon'
+import DragNumberInput from '@/components/common/DragNumberInput.vue'
 
 const editor = useSplatEditor()
+const babylon = useBabylon()
 
-// Use computed refs that bind to the store
+// Create a reactive transform that reads directly from the mesh
+const meshTransform = ref({
+  position: { x: 0, y: 0, z: 0 },
+  rotation: { x: 0, y: 0, z: 0 },
+  scale: { x: 1, y: 1, z: 1 }
+})
+
+// Scale lock state for uniform scaling
+const scaleUniformLocked = ref(true)
+
+// Watch for lock state changes - when locked, sync Y and Z to X
+watch(scaleUniformLocked, (isLocked, wasLocked) => {
+  if (isLocked && !wasLocked) {
+    // Just became locked - sync Y and Z to match X
+    const xValue = meshTransform.value.scale.x
+    editor.updateScale('y', xValue)
+    editor.updateScale('z', xValue)
+  }
+})
+
+// Poll the mesh transform to keep UI in sync
+let pollInterval: number | null = null
+
+function updateMeshTransform() {
+  const transform = babylon.getMeshTransform()
+  if (transform) {
+    meshTransform.value = transform
+  }
+}
+
+onMounted(() => {
+  // Update immediately
+  updateMeshTransform()
+  
+  // Poll at 60fps to keep in sync with Babylon updates
+  pollInterval = window.setInterval(updateMeshTransform, 16)
+})
+
+onUnmounted(() => {
+  if (pollInterval !== null) {
+    clearInterval(pollInterval)
+    pollInterval = null
+  }
+})
+
+// Computed refs that bind directly to the mesh
 const positionX = computed({
-  get: () => editor.splatTransform.value.position.x,
+  get: () => meshTransform.value.position.x,
   set: (val) => editor.updatePosition('x', val)
 })
 const positionY = computed({
-  get: () => editor.splatTransform.value.position.y,
+  get: () => meshTransform.value.position.y,
   set: (val) => editor.updatePosition('y', val)
 })
 const positionZ = computed({
-  get: () => editor.splatTransform.value.position.z,
+  get: () => meshTransform.value.position.z,
   set: (val) => editor.updatePosition('z', val)
 })
 
 const rotationX = computed({
-  get: () => editor.splatTransform.value.rotation.x,
+  get: () => meshTransform.value.rotation.x,
   set: (val) => editor.updateRotation('x', val)
 })
 const rotationY = computed({
-  get: () => editor.splatTransform.value.rotation.y,
+  get: () => meshTransform.value.rotation.y,
   set: (val) => editor.updateRotation('y', val)
 })
 const rotationZ = computed({
-  get: () => editor.splatTransform.value.rotation.z,
+  get: () => meshTransform.value.rotation.z,
   set: (val) => editor.updateRotation('z', val)
 })
 
 const scaleX = computed({
-  get: () => editor.splatTransform.value.scale.x,
-  set: (val) => editor.updateScale('x', val)
+  get: () => meshTransform.value.scale.x,
+  set: (val) => {
+    if (scaleUniformLocked.value) {
+      editor.updateScale('x', val)
+      editor.updateScale('y', val)
+      editor.updateScale('z', val)
+    } else {
+      editor.updateScale('x', val)
+    }
+  }
 })
 const scaleY = computed({
-  get: () => editor.splatTransform.value.scale.y,
-  set: (val) => editor.updateScale('y', val)
+  get: () => meshTransform.value.scale.y,
+  set: (val) => {
+    if (scaleUniformLocked.value) {
+      editor.updateScale('x', val)
+      editor.updateScale('y', val)
+      editor.updateScale('z', val)
+    } else {
+      editor.updateScale('y', val)
+    }
+  }
 })
 const scaleZ = computed({
-  get: () => editor.splatTransform.value.scale.z,
-  set: (val) => editor.updateScale('z', val)
+  get: () => meshTransform.value.scale.z,
+  set: (val) => {
+    if (scaleUniformLocked.value) {
+      editor.updateScale('x', val)
+      editor.updateScale('y', val)
+      editor.updateScale('z', val)
+    } else {
+      editor.updateScale('z', val)
+    }
+  }
+})
+
+// Uniform scale value (uses X as the primary value)
+const uniformScale = computed({
+  get: () => meshTransform.value.scale.x,
+  set: (val) => {
+    editor.updateScale('x', val)
+    editor.updateScale('y', val)
+    editor.updateScale('z', val)
+  }
 })
 
 const hasScene = computed(() => editor.hasScene.value)
@@ -64,34 +146,25 @@ const hasScene = computed(() => editor.hasScene.value)
           <div class="vector-inputs">
             <div class="vector-input">
               <span class="axis-label x">X</span>
-              <v-text-field
-                v-model.number="positionX"
-                type="number"
-                step="0.1"
-                hide-details
-                density="compact"
+              <DragNumberInput
+                v-model="positionX"
+                :step="0.1"
                 class="mono-input"
               />
             </div>
             <div class="vector-input">
               <span class="axis-label y">Y</span>
-              <v-text-field
-                v-model.number="positionY"
-                type="number"
-                step="0.1"
-                hide-details
-                density="compact"
+              <DragNumberInput
+                v-model="positionY"
+                :step="0.1"
                 class="mono-input"
               />
             </div>
             <div class="vector-input">
               <span class="axis-label z">Z</span>
-              <v-text-field
-                v-model.number="positionZ"
-                type="number"
-                step="0.1"
-                hide-details
-                density="compact"
+              <DragNumberInput
+                v-model="positionZ"
+                :step="0.1"
                 class="mono-input"
               />
             </div>
@@ -107,34 +180,25 @@ const hasScene = computed(() => editor.hasScene.value)
           <div class="vector-inputs">
             <div class="vector-input">
               <span class="axis-label x">X</span>
-              <v-text-field
-                v-model.number="rotationX"
-                type="number"
-                step="1"
-                hide-details
-                density="compact"
+              <DragNumberInput
+                v-model="rotationX"
+                :step="1"
                 class="mono-input"
               />
             </div>
             <div class="vector-input">
               <span class="axis-label y">Y</span>
-              <v-text-field
-                v-model.number="rotationY"
-                type="number"
-                step="1"
-                hide-details
-                density="compact"
+              <DragNumberInput
+                v-model="rotationY"
+                :step="1"
                 class="mono-input"
               />
             </div>
             <div class="vector-input">
               <span class="axis-label z">Z</span>
-              <v-text-field
-                v-model.number="rotationZ"
-                type="number"
-                step="1"
-                hide-details
-                density="compact"
+              <DragNumberInput
+                v-model="rotationZ"
+                :step="1"
                 class="mono-input"
               />
             </div>
@@ -146,38 +210,54 @@ const hasScene = computed(() => editor.hasScene.value)
           <div class="property-label">
             <v-icon size="small" class="mr-1">mdi-resize</v-icon>
             Scale
+            <v-btn
+              :icon="scaleUniformLocked ? 'mdi-link-variant' : 'mdi-link-variant-off'"
+              size="x-small"
+              variant="text"
+              :color="scaleUniformLocked ? 'primary' : undefined"
+              @click="scaleUniformLocked = !scaleUniformLocked"
+              class="lock-button"
+              :title="scaleUniformLocked ? 'Unlock for non-uniform scaling' : 'Lock for uniform scaling'"
+            />
           </div>
-          <div class="vector-inputs">
+          
+          <!-- Uniform Scale (locked) -->
+          <div v-if="scaleUniformLocked" class="uniform-scale-input">
+            <span class="uniform-label">Uniform</span>
+            <DragNumberInput
+              v-model="uniformScale"
+              :step="0.1"
+              :min="0.01"
+              class="mono-input"
+            />
+          </div>
+          
+          <!-- Individual Scales (unlocked) -->
+          <div v-else class="vector-inputs">
             <div class="vector-input">
               <span class="axis-label x">X</span>
-              <v-text-field
-                v-model.number="scaleX"
-                type="number"
-                step="0.1"
-                hide-details
-                density="compact"
+              <DragNumberInput
+                v-model="scaleX"
+                :step="0.1"
+                :min="0.01"
                 class="mono-input"
               />
             </div>
             <div class="vector-input">
               <span class="axis-label y">Y</span>
-              <v-text-field
-                v-model.number="scaleY"
-                type="number"
-                step="0.1"
-                hide-details
-                density="compact"
+              <DragNumberInput
+                v-model="scaleY"
+                :step="0.1"
+                :min="0.01"
                 class="mono-input"
               />
             </div>
             <div class="vector-input">
               <span class="axis-label z">Z</span>
-              <v-text-field
-                v-model.number="scaleZ"
-                type="number"
-                step="0.1"
-                hide-details
-                density="compact"
+              <DragNumberInput
+                v-model="scaleZ"
+                :step="0.1"
+                :min="0.01"
                 class="mono-input"
               />
             </div>
@@ -228,6 +308,16 @@ const hasScene = computed(() => editor.hasScene.value)
   letter-spacing: 0.5px;
   color: #9898A8;
   margin-bottom: 8px;
+  
+  .lock-button {
+    margin-left: auto;
+    opacity: 0.6;
+    transition: opacity 0.2s ease;
+    
+    &:hover {
+      opacity: 1;
+    }
+  }
 }
 
 .vector-inputs {
@@ -250,6 +340,19 @@ const hasScene = computed(() => editor.hasScene.value)
   &.x { color: #FF6B6B; }
   &.y { color: #4ECDC4; }
   &.z { color: #6B8AFF; }
+}
+
+.uniform-scale-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.uniform-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #9898A8;
+  min-width: 60px;
 }
 
 .mono-input {

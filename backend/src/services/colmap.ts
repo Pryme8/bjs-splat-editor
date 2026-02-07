@@ -270,13 +270,17 @@ async function runColmap(
   command: string,
   args: string[],
   onOutput?: (line: string) => void,
-  jobId?: string
+  jobId?: string,
+  env?: Record<string, string>
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const colmapPath = getColmapPath()
     console.log(`[COLMAP] Running: ${colmapPath} ${command} ${args.join(' ')}`)
     // Use shell: true for Windows batch file compatibility
-    const proc = spawn(`"${colmapPath}"`, [command, ...args], { shell: true })
+    const proc = spawn(`"${colmapPath}"`, [command, ...args], { 
+      shell: true,
+      env: env ? { ...process.env, ...env } : undefined
+    })
     
     // Register process for cancellation tracking
     if (jobId) {
@@ -358,10 +362,12 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
 
       try {
         const result = await extractLearnedFeatures(imagesDir, databasePath, {
+          jobId,
           maxKeypoints: learnedFeaturesMaxKeypoints,
           maxImageSize: getMaxImageSize(),
-          sequentialMatching: settings.matcherType === 'sequential',
-          onProgress: (message, phase, current, total) => {
+          matchStrategy: settings.matcherType === 'sequential' ? 'window' : 'retrieval',
+          skipVerification: false,
+          onProgress: (message, phase, current, total, deviceInfo) => {
             // Features: 10-25%, Matching: 25-45%
             let progressPct: number
             if (phase === 'features') {
@@ -372,22 +378,29 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
             onProgress({
               status: 'learned_features',
               message: `DISK + LightGlue: ${message}`,
-              progress: progressPct
+              progress: progressPct,
+              deviceType: deviceInfo?.deviceType,
+              deviceName: deviceInfo?.deviceName
             })
           }
         })
 
-        console.log(`[COLMAP] Learned features: ${result.images} images, ${result.total_matches} matches`)
-        if (result.verified_pairs !== undefined) {
+        console.log(`[COLMAP] Learned features: ${result.images} images, ${result.total_matches} matches (${result.match_strategy || 'unknown'} strategy, ${result.total_pairs || 0} pairs)`)
+        if (result.verified_pairs) {
           console.log(`[COLMAP] Geometric verification: ${result.verified_pairs} pairs, ${result.total_inliers} inliers`)
+        }
+        if (result.device_type && result.device_name) {
+          console.log(`[COLMAP] Device: ${result.device_name} (${result.device_type.toUpperCase()})`)
         }
         
         onProgress({
           status: 'learned_features',
           message: result.verified_pairs 
             ? `Features complete: ${result.verified_pairs} verified pairs, ${result.avg_inliers_per_pair?.toFixed(0) || 0} avg inliers`
-            : `Features complete: ${result.avg_keypoints_per_image.toFixed(0)} avg keypoints, ${result.avg_matches_per_pair.toFixed(0)} avg matches`,
-          progress: 45
+            : `Features complete: ${result.pairs_matched} matched pairs, ${result.avg_matches_per_pair.toFixed(0)} avg matches`,
+          progress: 45,
+          deviceType: result.device_type,
+          deviceName: result.device_name
         })
 
         // Skip to reconstruction (mapper) - features and matches already in database
@@ -402,7 +415,16 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
           onProgress
         )
       } catch (err) {
-        console.error('[COLMAP] Learned features failed, falling back to SIFT:', err)
+        const errMsg = err instanceof Error ? err.message : String(err)
+        const errStack = err instanceof Error ? err.stack : ''
+        console.error('[COLMAP] *** LEARNED FEATURES FAILED - falling back to SIFT ***')
+        console.error('[COLMAP] Error:', errMsg)
+        if (errStack) console.error('[COLMAP] Stack:', errStack)
+        onProgress({
+          status: 'sfm_features',
+          message: `DISK+LightGlue failed: ${errMsg.slice(0, 100)} - falling back to SIFT`,
+          progress: 10
+        })
         // Fall through to SIFT extraction
       }
     }
@@ -466,14 +488,39 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
     }, jobId)
   } else {
     // Exhaustive matching - compares all pairs
-    await runColmap('exhaustive_matcher', [
-      '--database_path', databasePath,
-      '--ExhaustiveMatching.block_size', '100',  // Load 100 images at once (default: 50)
-    ], (line) => {
-      if (line.includes('Matching')) {
-        onProgress({ message: `Feature matching: ${line}` })
-      }
-    }, jobId)
+    // Scale block_size based on image count to avoid GPU memory crashes
+    const imageFiles = await fs.readdir(imagesDir)
+    const imageCount = imageFiles.filter(f => /\.(jpg|jpeg|png|bmp|tif|tiff)$/i.test(f)).length
+    const blockSize = imageCount > 200 ? 25 : imageCount > 100 ? 50 : 100
+    console.log(`[COLMAP] Exhaustive matching: ${imageCount} images, block_size=${blockSize}`)
+
+    try {
+      await runColmap('exhaustive_matcher', [
+        '--database_path', databasePath,
+        '--ExhaustiveMatching.block_size', blockSize.toString(),
+      ], (line) => {
+        if (line.includes('Matching')) {
+          onProgress({ message: `Feature matching: ${line}` })
+        }
+      }, jobId)
+    } catch (gpuErr) {
+      // GPU matching crashed - retry on CPU
+      console.warn(`[COLMAP] GPU exhaustive matching failed, retrying with CPU: ${gpuErr}`)
+      onProgress({
+        status: 'sfm_matching',
+        message: 'GPU matching failed, retrying on CPU...',
+        progress: 30
+      })
+
+      await runColmap('exhaustive_matcher', [
+        '--database_path', databasePath,
+        '--ExhaustiveMatching.block_size', blockSize.toString(),
+      ], (line) => {
+        if (line.includes('Matching')) {
+          onProgress({ message: `Feature matching (CPU): ${line}` })
+        }
+      }, jobId, { CUDA_VISIBLE_DEVICES: '' })
+    }
   }
 
   // For 360° scenes, run transitive matching to fill in gaps and strengthen loop closure

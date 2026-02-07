@@ -1,15 +1,21 @@
 # AI Enhancement dependencies for bjs-splat-editor
 
-# PyTorch (use nightly for best compatibility)
-torch>=2.0.0
-# torchvision>=0.15.0  # Install matching version for your torch
+# PyTorch 2.7.1+ with CUDA 12.8 required for RTX 50xx series (sm_120 compute capability)
+# Install with: pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7.1
+torchvision>=0.22.1
 
-# Depth Anything V2
-transformers>=4.35.0
+# Depth Anything V2 + Grounding DINO + SAM
+transformers>=4.40.0
 
 # DISK + LightGlue
 kornia>=0.7.0
 opencv-python>=4.8.0
+
+# gsplat trainer (Python-based Gaussian Splatting)
+# Note: RTX 50xx GPUs require CUDA Toolkit 12.8+ for source build
+# pip install gaussian-splatting --no-binary gaussian-splatting
+gaussian-splatting>=1.22.0
 
 # Common
 Pillow>=9.0.0

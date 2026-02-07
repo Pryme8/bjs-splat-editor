@@ -36,6 +36,10 @@ export const useGeneratorStore = defineStore('generator', () => {
   // COLMAP preview state
   const colmapPreviewFetched = ref(false)
   
+  // Device info for current processing step
+  const currentDeviceType = ref<'gpu' | 'cpu' | null>(null)
+  const currentDeviceName = ref<string | null>(null)
+  
   // Watch intermediate results and update the 3D view
   watch(intermediateResult, async (newResult) => {
     if (newResult) {
@@ -185,7 +189,9 @@ export const useGeneratorStore = defineStore('generator', () => {
         depthFloaterThreshold: config.value.depthFloaterThreshold,
         // AI Enhancement: Learned Features (DISK + LightGlue)
         learnedFeaturesEnabled: config.value.learnedFeaturesEnabled,
-        learnedFeaturesMaxKeypoints: config.value.learnedFeaturesMaxKeypoints
+        learnedFeaturesMaxKeypoints: config.value.learnedFeaturesMaxKeypoints,
+        // Trainer engine
+        trainerEngine: config.value.trainerEngine
       }
 
       const response = await BackendApi.CreateJob(images.value, jobConfig)
@@ -200,6 +206,12 @@ export const useGeneratorStore = defineStore('generator', () => {
       // Subscribe to progress updates
       BackendApi.SubscribeToJob(response.jobId, async (p) => {
         console.log('[GeneratorStore] Received progress update:', p.status, p.progress, p.message)
+        
+        // Update device info if provided
+        if (p.deviceType) {
+          currentDeviceType.value = p.deviceType
+          currentDeviceName.value = p.deviceName || null
+        }
         
         // Don't update progress to 'complete' until we've downloaded the result
         if (p.status === 'complete') {
@@ -385,6 +397,9 @@ export const useGeneratorStore = defineStore('generator', () => {
         babylon.removeSplat('preview')
         sceneStore.clearPreview()
         
+        // Extra defensive cleanup to catch any orphaned meshes
+        babylon.cleanupOrphanedSplats()
+        
         // Parse splat data (simplified - just store blob URL)
         result.value = {
           positions: new Float32Array(0), // Will load from blob
@@ -539,6 +554,9 @@ export const useGeneratorStore = defineStore('generator', () => {
       babylon.removeSplat('preview')
       sceneStore.clearPreview()
       
+      // Extra defensive cleanup to catch any orphaned meshes
+      babylon.cleanupOrphanedSplats()
+      
       // Estimate splat count from blob size
       const arrayBuffer = await blob.arrayBuffer()
       const splatCount = Math.floor(arrayBuffer.byteLength / 250)
@@ -599,6 +617,8 @@ export const useGeneratorStore = defineStore('generator', () => {
     lastIntermediateIteration.value = 0
     lastIntermediateFetchTime.value = 0
     colmapPreviewFetched.value = false
+    currentDeviceType.value = null
+    currentDeviceName.value = null
     
     // Clear preview from scene store and dispose preview mesh
     const sceneStore = useSceneStore()
@@ -608,6 +628,9 @@ export const useGeneratorStore = defineStore('generator', () => {
     
     // Clear COLMAP preview visualization
     babylon.clearColmapPreview()
+    
+    // Extra defensive cleanup to catch any orphaned meshes
+    babylon.cleanupOrphanedSplats()
   }
 
   // Map backend status to frontend stage
@@ -619,8 +642,10 @@ export const useGeneratorStore = defineStore('generator', () => {
       'sfm_features': 'sfm',
       'sfm_matching': 'sfm',
       'sfm_reconstruction': 'sfm',
+      'learned_features': 'sfm',
       'training_init': 'initializing',
       'training': 'optimizing',
+      'depth_filtering': 'finalizing',
       'exporting': 'finalizing',
       'complete': 'complete',
       'failed': 'error',
@@ -642,6 +667,8 @@ export const useGeneratorStore = defineStore('generator', () => {
     generatorMode,
     trainingMode,
     intermediateResult,
+    currentDeviceType,
+    currentDeviceName,
     
     // Computed
     isGenerating,

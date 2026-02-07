@@ -11,9 +11,17 @@ import fs from 'fs/promises'
 import type { ColmapResult, JobConfig, TrainingResult, JobProgress } from '../types/index.js'
 import { registerProcess } from './processTracker.js'
 
-// Read env var dynamically to ensure dotenv has loaded
+// Read env vars dynamically to ensure dotenv has loaded
 function getOpenSplatPath(): string {
   return process.env.OPENSPLAT_PATH || 'opensplat'
+}
+
+function getOpenSplatDockerImage(): string | undefined {
+  return process.env.OPENSPLAT_DOCKER_IMAGE
+}
+
+function getDockerPath(): string {
+  return process.env.DOCKER_PATH || 'docker'
 }
 
 /**
@@ -113,9 +121,30 @@ interface OpenSplatOptions {
 }
 
 /**
- * Check if OpenSplat is available
+ * Check if OpenSplat is available (native binary or Docker)
  */
 export async function checkOpenSplatAvailable(): Promise<boolean> {
+  // Check Docker mode first
+  const dockerImage = getOpenSplatDockerImage()
+  if (dockerImage) {
+    return new Promise((resolve) => {
+      const dockerPath = getDockerPath()
+      const proc = spawn(dockerPath, ['run', '--rm', dockerImage, '/app/build/opensplat', '--help'], {
+        shell: false,
+        timeout: 15000
+      })
+
+      proc.on('close', (code) => {
+        resolve(code === 0)
+      })
+
+      proc.on('error', () => {
+        resolve(false)
+      })
+    })
+  }
+
+  // Native binary mode
   return new Promise((resolve) => {
     const opensplatPath = getOpenSplatPath()
     const proc = spawn(opensplatPath, ['--help'], {
@@ -124,7 +153,6 @@ export async function checkOpenSplatAvailable(): Promise<boolean> {
     })
 
     proc.on('close', (code) => {
-      // OpenSplat returns 0 for --help
       resolve(code === 0)
     })
 
@@ -138,12 +166,25 @@ export async function checkOpenSplatAvailable(): Promise<boolean> {
  * Get OpenSplat version
  */
 export async function getOpenSplatVersion(): Promise<string | null> {
+  const dockerImage = getOpenSplatDockerImage()
+  
   return new Promise((resolve) => {
-    const opensplatPath = getOpenSplatPath()
-    const proc = spawn(opensplatPath, ['--help'], {
-      shell: true,
-      timeout: 5000
-    })
+    let cmd: string
+    let args: string[]
+    let opts: { shell: boolean; timeout: number }
+    
+    if (dockerImage) {
+      const dockerPath = getDockerPath()
+      cmd = dockerPath
+      args = ['run', '--rm', dockerImage, '/app/build/opensplat', '--help']
+      opts = { shell: false, timeout: 15000 }
+    } else {
+      cmd = getOpenSplatPath()
+      args = ['--help']
+      opts = { shell: true, timeout: 5000 }
+    }
+    
+    const proc = spawn(cmd, args, opts)
 
     let output = ''
     proc.stdout.on('data', (data) => {
@@ -151,7 +192,6 @@ export async function getOpenSplatVersion(): Promise<string | null> {
     })
 
     proc.on('close', () => {
-      // Try to extract version from help output
       const match = output.match(/OpenSplat\s+v?(\d+\.\d+\.\d+)/i)
       resolve(match ? match[1] : 'unknown')
     })
@@ -160,6 +200,13 @@ export async function getOpenSplatVersion(): Promise<string | null> {
       resolve(null)
     })
   })
+}
+
+/**
+ * Check if OpenSplat is running in Docker mode
+ */
+export function isDockerMode(): boolean {
+  return !!getOpenSplatDockerImage()
 }
 
 /**
@@ -247,14 +294,60 @@ export async function trainWithOpenSplat(
     args.push('--image-path', imagesDir)
   }
 
-  const opensplatPath = getOpenSplatPath()
-  console.log(`[OpenSplat] Running: ${opensplatPath} ${args.join(' ')}`)
+  // Determine execution mode: Docker or native binary
+  const dockerImage = getOpenSplatDockerImage()
+  let spawnCmd: string
+  let spawnArgs: string[]
+  let spawnOpts: { shell: boolean; cwd: string }
+
+  if (dockerImage) {
+    // Docker mode: mount project dir and run inside container
+    // Convert Windows paths to Docker-compatible format
+    const dockerProjectDir = colmapProjectDir.replace(/\\/g, '/')
+    const dockerOutputDir = outputDir.replace(/\\/g, '/')
+    const dockerImagesDir = imagesDir.replace(/\\/g, '/')
+    
+    // Remap args to use container paths
+    const containerProjectDir = '/workspace/project'
+    const containerOutputDir = '/workspace/output'
+    const containerImagesDir = '/workspace/images'
+    
+    // Replace host paths in args with container paths
+    const dockerArgs = args.map(a => {
+      if (a === colmapProjectDir) return containerProjectDir
+      if (a === outputPly) return path.posix.join(containerOutputDir, 'result.ply')
+      if (a === imagesDir) return containerImagesDir
+      return a
+    })
+    
+    const dockerPath = getDockerPath()
+    spawnCmd = dockerPath
+    spawnArgs = [
+      'run', '--rm',
+      '--gpus', 'all',
+      '--entrypoint', '/app/build/opensplat',
+      '-v', `${dockerProjectDir}:${containerProjectDir}`,
+      '-v', `${dockerOutputDir}:${containerOutputDir}`,
+      '-v', `${dockerImagesDir}:${containerImagesDir}`,
+      '-w', containerProjectDir,
+      dockerImage,
+      ...dockerArgs
+    ]
+    spawnOpts = { shell: false, cwd: outputDir }
+    
+    console.log(`[OpenSplat] Running via Docker: ${dockerPath} ${spawnArgs.join(' ')}`)
+  } else {
+    // Native binary mode (original behavior)
+    const opensplatPath = getOpenSplatPath()
+    spawnCmd = opensplatPath
+    spawnArgs = args
+    spawnOpts = { shell: true, cwd: outputDir }
+    
+    console.log(`[OpenSplat] Running: ${opensplatPath} ${args.join(' ')}`)
+  }
 
   return new Promise((resolve, reject) => {
-    const proc = spawn(opensplatPath, args, {
-      shell: true,
-      cwd: outputDir
-    })
+    const proc = spawn(spawnCmd, spawnArgs, spawnOpts)
     
     // Register process for cancellation tracking
     registerProcess(jobId, proc)
