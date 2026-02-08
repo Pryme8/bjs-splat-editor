@@ -10,7 +10,7 @@ import { v4 as uuidv4 } from 'uuid'
 import { fileURLToPath } from 'url'
 
 import { createJob, getJob, getAllJobs, cancelJob } from '../services/jobManager.js'
-import { findLatestIntermediate } from '../services/opensplat.js'
+import { findLatestIntermediate, cleanupOldIntermediates } from '../services/opensplat.js'
 import type { JobConfig, TrainingMode, TrainerEngine } from '../types/index.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -222,6 +222,8 @@ router.get('/:id/intermediate', async (req, res) => {
       const stats = await fs.stat(intermediatePath)
       console.log(`[Jobs] Found intermediate file: ${intermediatePath}, size: ${stats.size} bytes`)
       res.download(intermediatePath, `intermediate_${job.id}.ply`)
+      // Clean up older intermediate files in parallel (fire and forget)
+      cleanupOldIntermediates(jobDir, intermediatePath)
     } else {
       console.log(`[Jobs] No intermediate file found for job ${req.params.id}`)
       res.status(404).json({ error: 'No intermediate result available yet' })

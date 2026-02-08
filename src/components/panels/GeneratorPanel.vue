@@ -5,7 +5,7 @@ import { useSceneStore } from '@/stores/sceneStore'
 import { useVideoFrameStore } from '@/stores/videoFrameStore'
 import { useGenerator } from '@/composables/useGenerator'
 import { useBabylon } from '@/composables/useBabylon'
-import { SceneTypeLabels, SceneTypeDescriptions, type SceneType, TrainerEngineLabels, TrainerEngineDescriptions, type TrainerEngine } from '@/generator/types'
+import { SceneTypeLabels, SceneTypeDescriptions, type SceneType, TrainerEngineLabels, TrainerEngineDescriptions, type TrainerEngine, QualityPresetLabels, QualityPresetDescriptions, type QualityPreset } from '@/generator/types'
 import VideoFrameModal from '@/components/modals/VideoFrameModal.vue'
 import DragNumberInput from '@/components/common/DragNumberInput.vue'
 
@@ -541,7 +541,26 @@ function clearAndGenerate() {
         <div class="section">
           <div class="section-header">Settings</div>
           
+          <!-- Quality Preset Selector -->
           <div class="setting-row">
+            <span class="setting-label">Quality</span>
+          </div>
+          <v-btn-toggle
+            :model-value="generatorStore.qualityPreset"
+            @update:model-value="(v: QualityPreset) => generatorStore.applyPreset(v)"
+            mandatory
+            density="compact"
+            class="quality-preset-toggle mb-2"
+            :disabled="generatorStore.isGenerating"
+          >
+            <v-btn value="fast" size="small">Fast</v-btn>
+            <v-btn value="balanced" size="small">Balanced</v-btn>
+            <v-btn value="high" size="small">High</v-btn>
+            <v-btn value="custom" size="small">Custom</v-btn>
+          </v-btn-toggle>
+          <p class="hint-text mb-2">{{ QualityPresetDescriptions[generatorStore.qualityPreset] }}</p>
+          
+          <div class="setting-row" v-if="generatorStore.qualityPreset === 'custom'">
             <span class="setting-label">Iterations</span>
             <DragNumberInput
               :model-value="generatorStore.config.iterations"
@@ -555,7 +574,7 @@ function clearAndGenerate() {
             />
           </div>
 
-          <div class="setting-row">
+          <div class="setting-row" v-if="generatorStore.qualityPreset === 'custom'">
             <span class="setting-label">Resolution</span>
             <v-select
               :model-value="generatorStore.config.resolution"
@@ -631,7 +650,7 @@ function clearAndGenerate() {
           <div class="setting-row mt-3">
             <span class="setting-label">Learned Features</span>
             <v-switch
-              :model-value="generatorStore.config.learnedFeaturesEnabled ?? false"
+              :model-value="generatorStore.config.learnedFeaturesEnabled ?? true"
               @update:model-value="v => generatorStore.updateConfig({ learnedFeaturesEnabled: v ?? undefined })"
               hide-details
               density="compact"
@@ -641,14 +660,14 @@ function clearAndGenerate() {
           </div>
           
           <p v-if="generatorStore.config.learnedFeaturesEnabled" class="hint-text mb-2">
-            Uses DISK + LightGlue instead of SIFT for better matching
+            DISK + LightGlue (GPU-accelerated, falls back to SIFT if unavailable)
           </p>
           
           <div v-if="generatorStore.config.learnedFeaturesEnabled">
             <div class="setting-row">
               <span class="setting-label">Max Keypoints</span>
               <v-slider
-                :model-value="generatorStore.config.learnedFeaturesMaxKeypoints ?? 2048"
+                :model-value="generatorStore.config.learnedFeaturesMaxKeypoints ?? 4096"
                 @update:model-value="v => generatorStore.updateConfig({ learnedFeaturesMaxKeypoints: v })"
                 :min="1024"
                 :max="8192"
@@ -1155,6 +1174,22 @@ function clearAndGenerate() {
   font-size: 0.75rem;
   color: #5A5A6A;
   margin-top: 8px;
+}
+
+.hint-text {
+  font-size: 0.75rem;
+  color: #5A5A6A;
+  line-height: 1.3;
+}
+
+.quality-preset-toggle {
+  width: 100%;
+
+  .v-btn {
+    flex: 1;
+    font-size: 0.75rem;
+    letter-spacing: 0;
+  }
 }
 
 .setting-row {

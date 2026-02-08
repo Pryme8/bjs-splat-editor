@@ -236,113 +236,20 @@ export async function processTrainingJob(
       deviceName: 'CPU'
     })
 
-    // Optional: Run Depth Anything for depth estimation
+    // Run Depth Estimation and COLMAP SfM in parallel when depth is enabled
+    // Depth maps are only needed after training (for floater filtering), so they
+    // can run concurrently with COLMAP to eliminate the depth estimation wait time.
     let depthSummary: DepthSummary | null = null
     const depthDir = path.join(outputDir, 'depth')
     
-    // Debug: Log depth config
     console.log(`[TrainingWorker] Depth AI config: enabled=${config.depthEstimationEnabled}, model=${config.depthModelSize}, filter=${config.depthFloaterFilterEnabled}`)
-    
-    if (config.depthEstimationEnabled) {
-      startPhase('depth_estimation')
-      const depthAvailable = await checkDepthEstimationAvailable()
-      
-      if (depthAvailable) {
-        // Start with unknown device, will be updated once Python reports it
-        let depthDeviceType: 'gpu' | 'cpu' | undefined
-        let depthDeviceName: string | undefined
-        
-        onProgress({
-          jobId,
-          status: 'depth_estimation',
-          progress: 11,
-          message: 'Running AI depth estimation (Depth Anything)...'
-        })
-        
-        try {
-          depthSummary = await estimateDepth(
-            colmapImagesDir,
-            depthDir,
-            {
-              modelSize: config.depthModelSize || 'small',
-              saveVisualization: true
-            },
-            (line, deviceInfoUpdate) => {
-              // Update device info if provided
-              if (deviceInfoUpdate?.deviceType) {
-                depthDeviceType = deviceInfoUpdate.deviceType
-                depthDeviceName = deviceInfoUpdate.deviceName
-              }
-              
-              if (line.includes('%') || line.includes('Estimating') || line.includes('Device detected')) {
-                onProgress({
-                  jobId,
-                  status: 'depth_estimation',
-                  progress: 12,
-                  message: line.includes('Device detected') 
-                    ? `Depth estimation on ${depthDeviceName || 'unknown'}...`
-                    : `Depth estimation: ${line.substring(0, 60)}...`,
-                  deviceType: depthDeviceType,
-                  deviceName: depthDeviceName
-                })
-              }
-            },
-            jobId
-          )
-          
-          // Update device info from result and send final progress
-          if (depthSummary) {
-            depthDeviceType = depthSummary.device_type
-            depthDeviceName = depthSummary.device_name
-            
-            onProgress({
-              jobId,
-              status: 'depth_estimation',
-              progress: 14,
-              message: `Depth estimation complete (${depthSummary.device_name || 'unknown'})`,
-              deviceType: depthDeviceType,
-              deviceName: depthDeviceName
-            })
-          }
-          
-          console.log(`[TrainingWorker] Depth estimation complete: ${depthSummary.successful}/${depthSummary.total_images} images`)
-          
-          endPhase('depth_estimation')
-          
-          onProgress({
-            jobId,
-            status: 'depth_estimation',
-            progress: 14,
-            message: `Depth maps generated for ${depthSummary.successful} images [${formatElapsedTime(Date.now() - startTime)}]`,
-            deviceType: depthDeviceType || 'cpu',
-            deviceName: depthDeviceName || 'CPU'
-          })
-        } catch (depthError) {
-          endPhase('depth_estimation')
-          console.warn(`[TrainingWorker] Depth estimation failed, continuing without:`, depthError)
-          onProgress({
-            jobId,
-            status: 'preprocessing',
-            progress: 14,
-            message: 'Depth estimation failed, continuing without depth filtering',
-            deviceType: 'cpu',
-            deviceName: 'CPU'
-          })
-        }
-      } else {
-        console.log('[TrainingWorker] Depth estimation not available, skipping')
-        onProgress({
-          jobId,
-          status: 'preprocessing',
-          progress: 14,
-          message: 'Depth estimation not available (Python/dependencies missing)',
-          deviceType: 'cpu',
-          deviceName: 'CPU'
-        })
-      }
+
+    // Log learned features config
+    if (config.learnedFeaturesEnabled) {
+      console.log(`[TrainingWorker] Learned features config: enabled=${config.learnedFeaturesEnabled}, maxKeypoints=${config.learnedFeaturesMaxKeypoints || 4096}`)
     }
 
-    // Run COLMAP SfM pipeline
+    // Build the COLMAP promise
     startPhase('colmap')
     
     onProgress({
@@ -350,21 +257,16 @@ export async function processTrainingJob(
       status: 'sfm_features',
       progress: 15,
       message: `Running Structure from Motion (COLMAP)... [${formatElapsedTime(Date.now() - startTime)}]`,
-      deviceType: 'cpu',  // COLMAP runs on CPU
+      deviceType: 'cpu',
       deviceName: 'CPU'
     })
 
-    // Log learned features config
-    if (config.learnedFeaturesEnabled) {
-      console.log(`[TrainingWorker] Learned features config: enabled=${config.learnedFeaturesEnabled}, maxKeypoints=${config.learnedFeaturesMaxKeypoints || 2048}`)
-    }
-
-    const colmapResult = await runColmapPipeline({
+    const colmapPromise = runColmapPipeline({
       jobId,
       imagesDir: colmapImagesDir,
       outputDir,
       sceneType: config.sceneType,
-      // AI Enhancement: Learned Features
+      resolution: config.resolution,
       learnedFeaturesEnabled: config.learnedFeaturesEnabled,
       learnedFeaturesMaxKeypoints: config.learnedFeaturesMaxKeypoints,
       onProgress: (partial) => {
@@ -373,13 +275,81 @@ export async function processTrainingJob(
           status: partial.status || 'sfm_features',
           progress: partial.progress || 15,
           message: partial.message || 'Processing...',
-          // Use device info from partial if available (for learned features GPU detection),
-          // otherwise default to CPU (traditional COLMAP)
           deviceType: partial.deviceType || 'cpu',
           deviceName: partial.deviceName || 'CPU'
         })
       }
     })
+
+    // Build the depth estimation promise (runs in parallel with COLMAP)
+    let depthPromise: Promise<void> = Promise.resolve()
+    
+    if (config.depthEstimationEnabled) {
+      const depthAvailable = await checkDepthEstimationAvailable()
+      
+      if (depthAvailable) {
+        startPhase('depth_estimation')
+        let depthDeviceType: 'gpu' | 'cpu' | undefined
+        let depthDeviceName: string | undefined
+
+        console.log('[TrainingWorker] Starting depth estimation in parallel with COLMAP...')
+        
+        depthPromise = estimateDepth(
+          colmapImagesDir,
+          depthDir,
+          {
+            modelSize: config.depthModelSize || 'small',
+            saveVisualization: true
+          },
+          (line, deviceInfoUpdate) => {
+            if (deviceInfoUpdate?.deviceType) {
+              depthDeviceType = deviceInfoUpdate.deviceType
+              depthDeviceName = deviceInfoUpdate.deviceName
+            }
+            if (line.includes('%') || line.includes('Estimating') || line.includes('Device detected')) {
+              onProgress({
+                jobId,
+                status: 'depth_estimation',
+                progress: 12,
+                message: line.includes('Device detected') 
+                  ? `[Parallel] Depth estimation on ${depthDeviceName || 'unknown'}...`
+                  : `[Parallel] Depth: ${line.substring(0, 50)}...`,
+                deviceType: depthDeviceType,
+                deviceName: depthDeviceName
+              })
+            }
+          },
+          jobId
+        ).then((summary) => {
+          depthSummary = summary
+          endPhase('depth_estimation')
+          console.log(`[TrainingWorker] Depth estimation complete: ${summary.successful}/${summary.total_images} images (parallel)`)
+          console.log(`[TrainingWorker] ⏱️ Depth estimation completed in ${formatElapsedTime(phaseDurations.depth_estimation || 0)}`)
+        }).catch((depthError) => {
+          endPhase('depth_estimation')
+          console.warn(`[TrainingWorker] Depth estimation failed (parallel), continuing without:`, depthError)
+          onProgress({
+            jobId,
+            status: 'depth_estimation',
+            progress: 14,
+            message: 'Depth estimation failed, continuing without depth filtering',
+            notification: 'Depth estimation failed, continuing without depth filtering',
+            notificationDuration: 0
+          })
+        })
+      } else {
+        console.log('[TrainingWorker] Depth estimation not available, skipping')
+      }
+    }
+
+    // Wait for COLMAP (required) and depth (optional) to both complete
+    // Use Promise.allSettled so depth failure doesn't kill COLMAP
+    const [colmapSettled] = await Promise.allSettled([colmapPromise, depthPromise])
+    
+    if (colmapSettled.status === 'rejected') {
+      throw colmapSettled.reason
+    }
+    const colmapResult = colmapSettled.value
 
     endPhase('colmap')
     

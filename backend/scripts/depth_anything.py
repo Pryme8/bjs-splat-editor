@@ -113,6 +113,90 @@ def estimate_depth(model_dict: dict, image_path: Path) -> tuple[np.ndarray, dict
     return depth_normalized, metadata
 
 
+def estimate_depth_batch(model_dict: dict, image_paths: list[Path]) -> list[tuple[np.ndarray, dict]]:
+    """
+    Run depth estimation on a batch of images for GPU efficiency.
+    
+    The processor handles resizing to the model's expected input size,
+    so we batch at that level and then interpolate each result back
+    to its original resolution individually.
+    """
+    model = model_dict["model"]
+    processor = model_dict["processor"]
+    device = model_dict["device"]
+    
+    # Load all images and record original sizes
+    pil_images = []
+    original_sizes = []
+    valid_indices = []
+    
+    for i, image_path in enumerate(image_paths):
+        try:
+            img = Image.open(image_path).convert("RGB")
+            pil_images.append(img)
+            original_sizes.append(img.size)  # (width, height)
+            valid_indices.append(i)
+        except Exception as e:
+            print(f"Error loading {image_path.name}: {e}", file=sys.stderr)
+    
+    if not pil_images:
+        return []
+    
+    # Process batch through the processor (handles resize + normalize)
+    inputs = processor(images=pil_images, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # Run batch inference
+    with torch.no_grad():
+        outputs = model(**inputs)
+        predicted_depths = outputs.predicted_depth  # [B, H, W]
+    
+    # Post-process each result back to original resolution
+    results = []
+    for idx, (depth_tensor, orig_size) in enumerate(zip(predicted_depths, original_sizes)):
+        prediction = torch.nn.functional.interpolate(
+            depth_tensor.unsqueeze(0).unsqueeze(0),
+            size=(orig_size[1], orig_size[0]),  # (height, width)
+            mode="bicubic",
+            align_corners=False,
+        )
+        
+        depth = prediction.squeeze().cpu().numpy()
+        
+        depth_min = depth.min()
+        depth_max = depth.max()
+        depth_normalized = (depth - depth_min) / (depth_max - depth_min + 1e-8)
+        
+        metadata = {
+            "width": orig_size[0],
+            "height": orig_size[1],
+            "depth_min": float(depth_min),
+            "depth_max": float(depth_max),
+            "source": str(image_paths[valid_indices[idx]].name)
+        }
+        
+        results.append((depth_normalized, metadata))
+    
+    return results
+
+
+def get_auto_batch_size(device: torch.device) -> int:
+    """Auto-detect batch size based on available GPU memory."""
+    if device.type == 'cuda':
+        props = torch.cuda.get_device_properties(0)
+        total_gb = props.total_memory / (1024 ** 3)
+        if total_gb >= 16:
+            return 8
+        elif total_gb >= 8:
+            return 4
+        else:
+            return 2
+    elif device.type == 'mps':
+        return 4
+    else:
+        return 1  # CPU: no benefit from batching
+
+
 def save_depth(depth: np.ndarray, output_path: Path, save_vis: bool = True):
     """
     Save depth map as 16-bit PNG for precision
@@ -135,10 +219,14 @@ def process_directory(
     input_dir: Path,
     output_dir: Path,
     model_size: str = "small",
-    save_vis: bool = True
+    save_vis: bool = True,
+    batch_size: int = 0
 ) -> dict:
     """
-    Process all images in a directory
+    Process all images in a directory using batched inference.
+    
+    Args:
+        batch_size: Images per batch. 0 = auto-detect based on GPU memory.
     
     Returns summary with metadata for all processed images
     """
@@ -159,36 +247,63 @@ def process_directory(
     
     # Load model
     model_dict = setup_model(model_size)
+    device = model_dict["device"]
     
-    # Process each image
+    # Determine batch size
+    if batch_size <= 0:
+        batch_size = get_auto_batch_size(device)
+    print(f"Using batch size: {batch_size}", file=sys.stderr)
+    
+    # Process in batches
     results = []
-    for image_path in tqdm(images, desc="Estimating depth"):
-        try:
-            depth, metadata = estimate_depth(model_dict, image_path)
-            
-            # Save depth map
-            output_path = output_dir / f"{image_path.stem}_depth.png"
-            save_depth(depth, output_path, save_vis=save_vis)
-            
-            metadata["output_file"] = str(output_path.name)
-            results.append(metadata)
-            
-        except Exception as e:
-            print(f"Error processing {image_path.name}: {e}", file=sys.stderr)
-            results.append({
-                "source": str(image_path.name),
-                "error": str(e)
-            })
+    for i in tqdm(range(0, len(images), batch_size), desc="Estimating depth"):
+        batch_paths = images[i:i + batch_size]
+        
+        if batch_size == 1:
+            # Single image path (CPU or fallback)
+            for image_path in batch_paths:
+                try:
+                    depth, metadata = estimate_depth(model_dict, image_path)
+                    output_path = output_dir / f"{image_path.stem}_depth.png"
+                    save_depth(depth, output_path, save_vis=save_vis)
+                    metadata["output_file"] = str(output_path.name)
+                    results.append(metadata)
+                except Exception as e:
+                    print(f"Error processing {image_path.name}: {e}", file=sys.stderr)
+                    results.append({"source": str(image_path.name), "error": str(e)})
+        else:
+            # Batched inference
+            try:
+                batch_results = estimate_depth_batch(model_dict, batch_paths)
+                for depth, metadata in batch_results:
+                    source_stem = Path(metadata["source"]).stem
+                    output_path = output_dir / f"{source_stem}_depth.png"
+                    save_depth(depth, output_path, save_vis=save_vis)
+                    metadata["output_file"] = str(output_path.name)
+                    results.append(metadata)
+            except Exception as e:
+                # Batch failed, fall back to sequential for this batch
+                print(f"Batch inference failed, processing individually: {e}", file=sys.stderr)
+                for image_path in batch_paths:
+                    try:
+                        depth, metadata = estimate_depth(model_dict, image_path)
+                        output_path = output_dir / f"{image_path.stem}_depth.png"
+                        save_depth(depth, output_path, save_vis=save_vis)
+                        metadata["output_file"] = str(output_path.name)
+                        results.append(metadata)
+                    except Exception as e2:
+                        print(f"Error processing {image_path.name}: {e2}", file=sys.stderr)
+                        results.append({"source": str(image_path.name), "error": str(e2)})
     
     # Save summary
-    device = model_dict["device"]
     summary = {
         "model": model_size,
         "total_images": len(images),
         "successful": len([r for r in results if "error" not in r]),
         "images": results,
         "device_type": "gpu" if device.type in ['cuda', 'mps'] else "cpu",
-        "device_name": torch.cuda.get_device_name(0) if device.type == 'cuda' else device.type.upper()
+        "device_name": torch.cuda.get_device_name(0) if device.type == 'cuda' else device.type.upper(),
+        "batch_size": batch_size
     }
     
     summary_path = output_dir / "depth_summary.json"
@@ -206,6 +321,8 @@ def main():
                        help="Model size (default: small)")
     parser.add_argument("--no-vis", action="store_true", help="Don't save visualization images")
     parser.add_argument("--json", action="store_true", help="Output summary as JSON to stdout")
+    parser.add_argument("--batch_size", type=int, default=0,
+                       help="Batch size for inference (0 = auto-detect based on GPU memory)")
     
     args = parser.parse_args()
     
@@ -221,7 +338,8 @@ def main():
             input_dir=input_dir,
             output_dir=output_dir,
             model_size=args.model,
-            save_vis=not args.no_vis
+            save_vis=not args.no_vis,
+            batch_size=args.batch_size
         )
         
         if args.json:

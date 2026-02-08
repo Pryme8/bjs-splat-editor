@@ -135,8 +135,8 @@ export async function trainWithGsplat(
   await fs.mkdir(gsplatOutputDir, { recursive: true })
 
   // Build command arguments
-  const iterations = config.iterations || 30000
-  const saveEvery = Math.max(100, Math.floor(iterations * 0.1))
+  const iterations = config.iterations || 15000
+  const saveEvery = 500
 
   const args = [
     '-u',  // Unbuffered output for real-time progress

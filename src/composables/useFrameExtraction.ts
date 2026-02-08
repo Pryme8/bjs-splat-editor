@@ -10,6 +10,9 @@ import { useVideoFrameStore } from '@/stores/videoFrameStore'
 export interface ExtractionOptions {
   quality?: number  // Image quality 0-1, default 1.0 (lossless for PNG)
   format?: 'image/jpeg' | 'image/png'
+  maxResolution?: number  // Cap longest edge to this resolution (maintains aspect ratio)
+  sharpFrameSelection?: boolean  // Enable sharpness-based frame selection
+  sharpnessWindowSize?: number  // Number of adjacent frames to analyze (default: 5)
   onProgress?: (current: number, total: number) => void
 }
 
@@ -21,6 +24,11 @@ export function useFrameExtraction() {
   const canvas = ref<HTMLCanvasElement | null>(null)
   const ctx = ref<CanvasRenderingContext2D | null>(null)
   
+  // Small analysis canvas for sharpness computation
+  const analysisCanvas = ref<HTMLCanvasElement | null>(null)
+  const analysisCtx = ref<CanvasRenderingContext2D | null>(null)
+  const ANALYSIS_MAX_SIZE = 512  // Max resolution for sharpness analysis
+  
   /**
    * Initialize canvas for frame extraction
    */
@@ -28,9 +36,163 @@ export function useFrameExtraction() {
     if (!canvas.value) {
       canvas.value = document.createElement('canvas')
     }
+    // Setting canvas dimensions clears it and resets the context state
     canvas.value.width = width
     canvas.value.height = height
-    ctx.value = canvas.value.getContext('2d')
+    // Always get a fresh context after dimension changes
+    ctx.value = canvas.value.getContext('2d', { alpha: false })
+  }
+  
+  /**
+   * Initialize analysis canvas for sharpness computation
+   */
+  function initAnalysisCanvas(width: number, height: number) {
+    if (!analysisCanvas.value) {
+      analysisCanvas.value = document.createElement('canvas')
+    }
+    analysisCanvas.value.width = width
+    analysisCanvas.value.height = height
+    analysisCtx.value = analysisCanvas.value.getContext('2d', { willReadFrequently: true })
+  }
+  
+  /**
+   * Compute sharpness score using Laplacian variance
+   * Higher score = sharper image
+   */
+  function computeSharpnessScore(imageData: ImageData): number {
+    const { data, width, height } = imageData
+    
+    // Convert to grayscale and store in array
+    const gray: number[] = []
+    for (let i = 0; i < data.length; i += 4) {
+      const r = data[i]
+      const g = data[i + 1]
+      const b = data[i + 2]
+      // Standard grayscale conversion
+      const grayValue = 0.299 * r + 0.587 * g + 0.114 * b
+      gray.push(grayValue)
+    }
+    
+    // Apply Laplacian kernel: [[0,1,0],[1,-4,1],[0,1,0]]
+    const laplacian: number[] = []
+    for (let y = 1; y < height - 1; y++) {
+      for (let x = 1; x < width - 1; x++) {
+        const idx = y * width + x
+        const center = gray[idx]
+        const top = gray[idx - width]
+        const bottom = gray[idx + width]
+        const left = gray[idx - 1]
+        const right = gray[idx + 1]
+        
+        const lap = top + bottom + left + right - 4 * center
+        laplacian.push(lap)
+      }
+    }
+    
+    // Compute variance of Laplacian
+    if (laplacian.length === 0) return 0
+    
+    const mean = laplacian.reduce((sum, val) => sum + val, 0) / laplacian.length
+    const variance = laplacian.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / laplacian.length
+    
+    return variance
+  }
+  
+  /**
+   * Capture frame at timestamp and compute sharpness score
+   */
+  async function captureAndScoreFrame(
+    video: HTMLVideoElement,
+    time: number
+  ): Promise<{ time: number; score: number }> {
+    // Seek to time
+    video.currentTime = time
+    
+    // Wait for seek to complete
+    await new Promise<void>((resolve, reject) => {
+      const onSeeked = () => {
+        video.removeEventListener('seeked', onSeeked)
+        video.removeEventListener('error', onError)
+        resolve()
+      }
+      const onError = () => {
+        video.removeEventListener('seeked', onSeeked)
+        video.removeEventListener('error', onError)
+        reject(new Error('Video seek failed'))
+      }
+      video.addEventListener('seeked', onSeeked)
+      video.addEventListener('error', onError)
+    })
+    
+    // Calculate analysis dimensions (scaled down for speed)
+    let width = video.videoWidth
+    let height = video.videoHeight
+    if (Math.max(width, height) > ANALYSIS_MAX_SIZE) {
+      const scale = ANALYSIS_MAX_SIZE / Math.max(width, height)
+      width = Math.round(width * scale)
+      height = Math.round(height * scale)
+    }
+    
+    // Ensure analysis canvas is initialized
+    if (!analysisCanvas.value || analysisCanvas.value.width !== width || analysisCanvas.value.height !== height) {
+      initAnalysisCanvas(width, height)
+    }
+    
+    if (!analysisCtx.value) {
+      throw new Error('Analysis canvas context not available')
+    }
+    
+    // Draw frame to analysis canvas
+    analysisCtx.value.drawImage(video, 0, 0, width, height)
+    
+    // Get image data and compute sharpness
+    const imageData = analysisCtx.value.getImageData(0, 0, width, height)
+    const score = computeSharpnessScore(imageData)
+    
+    return { time, score }
+  }
+  
+  /**
+   * Find the sharpest frame in a window around the target time
+   */
+  async function findSharpestFrame(
+    video: HTMLVideoElement,
+    targetTime: number,
+    windowSize: number
+  ): Promise<number> {
+    // Generate candidate timestamps centered on target
+    // Space them at 1/30s intervals (assuming 30fps - works for most videos)
+    const frameInterval = 1 / 30
+    const halfWindow = Math.floor(windowSize / 2)
+    
+    const candidates: number[] = []
+    for (let i = -halfWindow; i <= halfWindow; i++) {
+      const candidateTime = targetTime + i * frameInterval
+      // Clamp to valid video range
+      if (candidateTime >= 0 && candidateTime <= video.duration) {
+        candidates.push(candidateTime)
+      }
+    }
+    
+    // If no valid candidates, return target time
+    if (candidates.length === 0) return targetTime
+    
+    // Score all candidates
+    const scores: Array<{ time: number; score: number }> = []
+    for (const time of candidates) {
+      try {
+        const result = await captureAndScoreFrame(video, time)
+        scores.push(result)
+      } catch (e) {
+        console.warn(`Failed to score frame at ${time}s:`, e)
+      }
+    }
+    
+    // Find the sharpest frame
+    if (scores.length === 0) return targetTime
+    
+    scores.sort((a, b) => b.score - a.score)
+    return scores[0].time
   }
   
   /**
@@ -41,7 +203,7 @@ export function useFrameExtraction() {
     time: number,
     options: ExtractionOptions = {}
   ): Promise<File> {
-    const { quality = 1.0, format = 'image/png' } = options
+    const { quality = 1.0, format = 'image/png', maxResolution } = options
     
     // Seek to time
     video.currentTime = time
@@ -62,17 +224,44 @@ export function useFrameExtraction() {
       video.addEventListener('error', onError)
     })
     
-    // Ensure canvas is initialized with video dimensions
-    if (!canvas.value || canvas.value.width !== video.videoWidth || canvas.value.height !== video.videoHeight) {
-      initCanvas(video.videoWidth, video.videoHeight)
+    // Calculate target dimensions (with optional resolution cap)
+    let width = video.videoWidth
+    let height = video.videoHeight
+    
+    // Safety check: ensure video has valid dimensions
+    if (width === 0 || height === 0) {
+      throw new Error(`Invalid video dimensions: ${width}x${height}`)
+    }
+    
+    const originalAspect = width / height
+    
+    if (maxResolution && Math.max(width, height) > maxResolution) {
+      const scale = maxResolution / Math.max(width, height)
+      width = Math.round(width * scale)
+      height = Math.round(height * scale)
+    }
+    
+    const targetAspect = width / height
+    
+    // Debug: log if aspect ratio changed (shouldn't happen)
+    if (Math.abs(originalAspect - targetAspect) > 0.01) {
+      console.warn(`Aspect ratio mismatch! Original: ${originalAspect.toFixed(3)}, Target: ${targetAspect.toFixed(3)}`)
+      console.warn(`Video: ${video.videoWidth}x${video.videoHeight}, Target: ${width}x${height}`)
+    }
+    
+    // Only reinitialize canvas if dimensions changed
+    if (!canvas.value || canvas.value.width !== width || canvas.value.height !== height) {
+      console.log(`Initializing canvas: ${width}x${height} (video: ${video.videoWidth}x${video.videoHeight})`)
+      initCanvas(width, height)
     }
     
     if (!ctx.value) {
       throw new Error('Canvas context not available')
     }
     
-    // Draw frame to canvas
-    ctx.value.drawImage(video, 0, 0, video.videoWidth, video.videoHeight)
+    // Draw frame to canvas at exact target dimensions
+    // The canvas is already sized correctly, this will scale the video frame
+    ctx.value.drawImage(video, 0, 0, width, height)
     
     // Convert to blob
     const blob = await new Promise<Blob>((resolve, reject) => {
@@ -90,7 +279,10 @@ export function useFrameExtraction() {
     const extension = format === 'image/png' ? 'png' : 'jpg'
     const filename = `frame_${time.toFixed(3).replace('.', '_')}.${extension}`
     
-    return new File([blob], filename, { type: format })
+    const file = new File([blob], filename, { type: format })
+    console.log(`Extracted frame: ${filename} (${width}x${height}, ${(blob.size * 0.001).toFixed(1)}KB)`)
+    
+    return file
   }
   
   /**
@@ -185,7 +377,60 @@ export function useFrameExtraction() {
       throw new Error('No frames selected for extraction')
     }
     
-    return extractFrames(video, timestamps, options)
+    const { sharpFrameSelection = false, sharpnessWindowSize = 5 } = options
+    
+    // If sharpness selection is enabled, find the sharpest frame for each timestamp
+    let finalTimestamps = timestamps
+    if (sharpFrameSelection && sharpnessWindowSize > 1) {
+      isExtracting.value = true
+      store.setExtracting(true)
+      
+      try {
+        // Pause video during analysis
+        const wasPlaying = !video.paused
+        video.pause()
+        
+        console.log(`Analyzing ${timestamps.length} timestamps for sharpness...`)
+        const analyzedTimestamps: number[] = []
+        
+        for (let i = 0; i < timestamps.length; i++) {
+          try {
+            const sharpestTime = await findSharpestFrame(video, timestamps[i], sharpnessWindowSize)
+            analyzedTimestamps.push(sharpestTime)
+            
+            // Report progress
+            const progress = ((i + 1) / timestamps.length) * 50  // First 50% is analysis
+            store.setExtractionProgress(progress)
+            
+            // Yield to UI every 10 frames
+            if (i % 10 === 0) {
+              await new Promise(resolve => setTimeout(resolve, 0))
+            }
+          } catch (e) {
+            console.warn(`Sharpness analysis failed for timestamp ${timestamps[i]}:`, e)
+            // Fall back to original timestamp
+            analyzedTimestamps.push(timestamps[i])
+          }
+        }
+        
+        finalTimestamps = analyzedTimestamps
+        console.log('Sharpness analysis complete')
+        
+        // Restore playback state
+        if (wasPlaying) {
+          video.play()
+        }
+      } catch (e) {
+        console.error('Sharpness analysis failed:', e)
+        // Fall back to original timestamps
+        finalTimestamps = timestamps
+      } finally {
+        store.setExtracting(false)
+        isExtracting.value = false
+      }
+    }
+    
+    return extractFrames(video, finalTimestamps, options)
   }
   
   /**
@@ -240,6 +485,8 @@ export function useFrameExtraction() {
   function cleanup() {
     canvas.value = null
     ctx.value = null
+    analysisCanvas.value = null
+    analysisCtx.value = null
   }
   
   return {

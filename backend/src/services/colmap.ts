@@ -21,11 +21,84 @@ function getColmapQuality(): string {
   return process.env.COLMAP_QUALITY || 'medium'
 }
 
+function getGlobalMapperSetting(): string {
+  return (process.env.COLMAP_USE_GLOBAL_MAPPER || 'auto').toLowerCase()
+}
+
+// Cache for global mapper availability
+let cachedGlobalMapperAvailable: boolean | null = null
+
+/**
+ * Detect COLMAP version by running `colmap --version` or `colmap help`
+ * Returns version string like "3.11" or null if unable to detect
+ */
+async function detectColmapVersion(): Promise<string | null> {
+  return new Promise((resolve) => {
+    const colmapPath = getColmapPath()
+    const proc = spawn(`"${colmapPath}"`, ['help'], { shell: true, timeout: 10000 })
+    let output = ''
+    proc.stdout.on('data', (data) => { output += data.toString() })
+    proc.stderr.on('data', (data) => { output += data.toString() })
+    proc.on('close', () => {
+      const match = output.match(/COLMAP\s+(\d+\.\d+(?:\.\d+)?)/i)
+      resolve(match ? match[1] : null)
+    })
+    proc.on('error', () => resolve(null))
+  })
+}
+
+/**
+ * Check if the global mapper (GLOMAP) is available.
+ * GLOMAP is integrated into COLMAP as `global_mapper`.
+ * We test by checking if the command exists in the help output.
+ */
+async function checkGlobalMapperAvailable(): Promise<boolean> {
+  if (cachedGlobalMapperAvailable !== null) return cachedGlobalMapperAvailable
+
+  const setting = getGlobalMapperSetting()
+  if (setting === 'false') {
+    cachedGlobalMapperAvailable = false
+    return false
+  }
+  if (setting === 'true') {
+    cachedGlobalMapperAvailable = true
+    return true
+  }
+
+  // Auto-detect: check if global_mapper appears in the command list from `colmap help`
+  return new Promise((resolve) => {
+    const colmapPath = getColmapPath()
+    const proc = spawn(`"${colmapPath}"`, ['help'], {
+      shell: true,
+      timeout: 15000
+    })
+    let output = ''
+    proc.stdout.on('data', (data) => { output += data.toString() })
+    proc.stderr.on('data', (data) => { output += data.toString() })
+    proc.on('close', () => {
+      const lines = output.split('\n').map(l => l.trim())
+      const available = lines.some(l => l === 'global_mapper')
+      cachedGlobalMapperAvailable = available
+      if (available) {
+        console.log('[COLMAP] Global mapper (GLOMAP) detected and available')
+      } else {
+        console.log('[COLMAP] Global mapper not available in this COLMAP version')
+      }
+      resolve(available)
+    })
+    proc.on('error', () => {
+      cachedGlobalMapperAvailable = false
+      resolve(false)
+    })
+  })
+}
+
 interface ColmapOptions {
   jobId: string
   imagesDir: string
   outputDir: string
   sceneType?: SceneType
+  resolution?: number  // Max image size for feature extraction (matches frontend resolution)
   onProgress: (progress: Partial<JobProgress>) => void
   // Learned features (DISK + LightGlue)
   learnedFeaturesEnabled?: boolean
@@ -166,41 +239,101 @@ async function runColmapMapper(
     progress: 50
   })
 
-  // Build mapper arguments - use more aggressive global BA for 360° scenes
-  const is360Scene = sceneType === 'building360'
-  const mapperArgs = [
-    '--database_path', databasePath,
-    '--image_path', imagesDir,
-    '--output_path', sparseDir,
-    // Global bundle adjustment settings - more iterations for 360° loop closure
-    '--Mapper.ba_global_max_num_iterations', is360Scene ? '100' : '50',
-    '--Mapper.ba_global_max_refinements', is360Scene ? '10' : '5',
-    '--Mapper.ba_global_points_freq', is360Scene ? '100000' : '250000',
-    '--Mapper.ba_global_frames_freq', is360Scene ? '200' : '500',
-    // Core mapper settings
-    '--Mapper.min_num_matches', settings.mapperMinNumMatches.toString(),
-    '--Mapper.init_min_num_inliers', settings.mapperInitMinNumInliers.toString(),
-    '--Mapper.abs_pose_min_num_inliers', settings.mapperAbsPoseMinNumInliers.toString(),
-    '--Mapper.abs_pose_min_inlier_ratio', settings.mapperAbsPoseMinInlierRatio.toString(),
-    '--Mapper.max_reg_trials', settings.mapperMaxRegTrials.toString(),
-    '--Mapper.filter_max_reproj_error', settings.mapperFilterMaxReprojError.toString(),
-    '--Mapper.multiple_models', '0',  // Force single model (all images together)
-  ]
+  // Try global mapper (GLOMAP) first if available -- 10-100x faster than incremental
+  const globalMapperAvailable = await checkGlobalMapperAvailable()
+  let usedGlobalMapper = false
 
-  // For 360° scenes, try harder to complete the loop
-  if (is360Scene) {
-    mapperArgs.push(
-      '--Mapper.tri_complete_max_transitivity', '10',
-      '--Mapper.tri_re_max_trials', '5'
-    )
-    console.log(`[COLMAP] Using enhanced global BA for 360° scene`)
+  if (globalMapperAvailable) {
+    try {
+      console.log('[COLMAP] Attempting global mapper (GLOMAP) for faster reconstruction...')
+      onProgress({
+        status: 'sfm_reconstruction',
+        message: 'Running global reconstruction (GLOMAP)...',
+        progress: 50
+      })
+
+      const glomapArgs = [
+        '--database_path', databasePath,
+        '--image_path', imagesDir,
+        '--output_path', sparseDir,
+      ]
+
+      await runColmap('global_mapper', glomapArgs, (line) => {
+        if (line.includes('Registering') || line.includes('Bundle') || line.includes('Position') || line.includes('Rotation')) {
+          onProgress({ message: `Global reconstruction: ${line}` })
+        }
+      }, jobId)
+
+      // Verify it produced output
+      const models = await fs.readdir(sparseDir)
+      if (models.length > 0) {
+        usedGlobalMapper = true
+        console.log('[COLMAP] Global mapper (GLOMAP) succeeded')
+      }
+    } catch (glomapErr) {
+      console.warn(`[COLMAP] Global mapper failed, falling back to incremental mapper: ${glomapErr}`)
+      onProgress({
+        status: 'sfm_reconstruction',
+        message: 'Global mapper failed, using incremental mapper...',
+        progress: 50,
+        notification: 'Global mapper (GLOMAP) failed, using incremental mapper',
+        notificationDuration: 0
+      })
+      // Clean up any partial output from failed glomap attempt
+      try {
+        const partialModels = await fs.readdir(sparseDir)
+        for (const model of partialModels) {
+          await fs.rm(path.join(sparseDir, model), { recursive: true, force: true })
+        }
+      } catch { /* ignore cleanup errors */ }
+    }
   }
 
-  await runColmap('mapper', mapperArgs, (line) => {
-    if (line.includes('Registering') || line.includes('Bundle adjustment')) {
-      onProgress({ message: `Reconstruction: ${line}` })
+  // Fall back to incremental mapper if global mapper not available or failed
+  if (!usedGlobalMapper) {
+    const is360Scene = sceneType === 'building360'
+    const mapperArgs = [
+      '--database_path', databasePath,
+      '--image_path', imagesDir,
+      '--output_path', sparseDir,
+      // GPU-accelerated bundle adjustment
+      '--Mapper.ba_use_gpu', '1',
+      // Global bundle adjustment - run frequently for GPU utilization
+      '--Mapper.ba_global_max_num_iterations', is360Scene ? '100' : '50',
+      '--Mapper.ba_global_max_refinements', is360Scene ? '5' : '3',
+      '--Mapper.ba_global_points_freq', '5000',   // Every 5K points (was 250K)
+      '--Mapper.ba_global_frames_freq', '10',     // Every 10 images (was 500)
+      // Local bundle adjustment - more iterations for better quality
+      '--Mapper.ba_local_max_num_iterations', '25',
+      // Core mapper settings
+      '--Mapper.min_num_matches', settings.mapperMinNumMatches.toString(),
+      '--Mapper.init_min_num_inliers', settings.mapperInitMinNumInliers.toString(),
+      '--Mapper.abs_pose_min_num_inliers', settings.mapperAbsPoseMinNumInliers.toString(),
+      '--Mapper.abs_pose_min_inlier_ratio', settings.mapperAbsPoseMinInlierRatio.toString(),
+      '--Mapper.max_reg_trials', settings.mapperMaxRegTrials.toString(),
+      '--Mapper.filter_max_reproj_error', settings.mapperFilterMaxReprojError.toString(),
+      '--Mapper.multiple_models', '0',  // Force single model (all images together)
+      // Performance optimizations
+      '--Mapper.tri_ignore_two_view_tracks', '1',  // Skip expensive 2-view tracks
+    ]
+
+    // For 360° scenes, try harder to complete the loop
+    if (is360Scene) {
+      mapperArgs.push(
+        '--Mapper.tri_complete_max_transitivity', '10',
+        '--Mapper.tri_re_max_trials', '5'
+      )
+      console.log(`[COLMAP] 360° scene: Enhanced BA (every 10 frames, GPU-accelerated)`)
+    } else {
+      console.log(`[COLMAP] Incremental mapper: GPU-accelerated BA (local + global every 10 frames)`)
     }
-  }, jobId)
+
+    await runColmap('mapper', mapperArgs, (line) => {
+      if (line.includes('Registering') || line.includes('Bundle adjustment')) {
+        onProgress({ message: `Reconstruction: ${line}` })
+      }
+    }, jobId)
+  }
 
   // Check if reconstruction succeeded
   const sparseModels = await fs.readdir(sparseDir)
@@ -211,7 +344,50 @@ async function runColmapMapper(
   // Use the first (usually best) model
   const modelDir = path.join(sparseDir, sparseModels[0])
 
-  // Step 4: Export to text format for easier parsing
+  // Step 4: Point filtering - remove noisy/outlier 3D points for cleaner reconstruction
+  onProgress({
+    status: 'sfm_reconstruction',
+    message: 'Filtering outlier points...',
+    progress: 65
+  })
+
+  const filteredDir = path.join(sparseDir, 'filtered')
+  await fs.mkdir(filteredDir, { recursive: true })
+  let exportModelDir = modelDir
+
+  try {
+    await runColmap('point_filtering', [
+      '--input_path', modelDir,
+      '--output_path', filteredDir,
+      '--min_track_len', '3',        // Points must be seen in >= 3 images
+      '--max_reproj_error', '4',     // Max reprojection error in pixels
+      '--min_tri_angle', '1.5',      // Min triangulation angle in degrees
+    ], (line) => {
+      if (line.includes('Filtered') || line.includes('points')) {
+        onProgress({ message: `Point filtering: ${line}` })
+      }
+    }, jobId)
+
+    // Check if filtering produced output, use filtered model going forward
+    const filteredFiles = await fs.readdir(filteredDir)
+    if (filteredFiles.length > 0) {
+      console.log('[COLMAP] Point filtering complete, using filtered model')
+      exportModelDir = filteredDir
+    } else {
+      console.log('[COLMAP] Point filtering produced no output, using original model')
+    }
+  } catch (filterErr) {
+    console.warn(`[COLMAP] Point filtering failed, using unfiltered model: ${filterErr}`)
+    onProgress({
+      status: 'sfm_reconstruction',
+      message: 'Point filtering skipped, using unfiltered model',
+      progress: 66,
+      notification: 'Point filtering failed, using unfiltered model',
+      notificationDuration: 2600
+    })
+  }
+
+  // Step 5: Export to text format for parsing
   onProgress({
     status: 'sfm_reconstruction',
     message: 'Exporting camera data...',
@@ -222,7 +398,7 @@ async function runColmapMapper(
   await fs.mkdir(textDir, { recursive: true })
 
   await runColmap('model_converter', [
-    '--input_path', modelDir,
+    '--input_path', exportModelDir,
     '--output_path', textDir,
     '--output_type', 'TXT'
   ], undefined, jobId)
@@ -230,6 +406,13 @@ async function runColmapMapper(
   // Parse results
   const cameras = await parseCamerasFile(path.join(textDir, 'cameras.txt'))
   const images = await parseImagesFile(path.join(textDir, 'images.txt'))
+  
+  // Log camera dimensions from COLMAP
+  for (const [cameraId, camera] of Object.entries(cameras)) {
+    console.log(`[COLMAP] Camera ${cameraId}: ${camera.model} ${camera.width}x${camera.height}, params: [${camera.params.join(', ')}]`)
+    const aspectRatio = camera.width / camera.height
+    console.log(`[COLMAP] Camera ${cameraId} aspect ratio: ${aspectRatio.toFixed(3)} (${camera.width / camera.height > 1 ? 'landscape' : 'portrait'})`)
+  }
   
   const registeredImageCount = images.length
   const { points: points3D, count: points3DCount } = await parsePoints3DFile(
@@ -339,10 +522,16 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
     imagesDir, 
     outputDir, 
     sceneType, 
+    resolution,
     onProgress,
     learnedFeaturesEnabled = false,
-    learnedFeaturesMaxKeypoints = 2048
+    learnedFeaturesMaxKeypoints = 4096
   } = options
+
+  // Use frontend resolution if provided, otherwise fall back to env var
+  const maxImageSize = resolution || getMaxImageSize()
+  console.log(`[COLMAP] Max image size: ${maxImageSize}${resolution ? ` (from config)` : ` (from env/default)`}`)
+  console.log(`[COLMAP] GPU acceleration: Bundle adjustment (local + global every 10 frames)`)
   
   // Create working directories
   const databasePath = path.join(outputDir, 'database.db')
@@ -364,6 +553,13 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
     const available = await checkLearnedFeaturesAvailable()
     if (!available) {
       console.warn('[COLMAP] Learned features requested but kornia not available, falling back to SIFT')
+      onProgress({
+        status: 'sfm_features',
+        message: 'DISK+LightGlue unavailable (Python/kornia missing), using SIFT...',
+        progress: 10,
+        notification: 'DISK+LightGlue unavailable, falling back to SIFT features',
+        notificationDuration: 0
+      })
     } else {
       onProgress({
         status: 'learned_features',
@@ -371,12 +567,31 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
         progress: 10
       })
 
+      // Count images to auto-select match strategy
+      const imageFiles = await fs.readdir(imagesDir)
+      const imageCount = imageFiles.filter(f => /\.(jpg|jpeg|png|bmp|tif|tiff)$/i.test(f)).length
+
+      // Auto-select matching strategy based on scene type and image count:
+      // - Sequential scenes use 'window' (sliding window for ordered images)
+      // - Small sets (<= 30 images) use 'exhaustive' (fast enough, best quality)
+      // - Large sets (> 30 images) use 'retrieval' (top-k by descriptor similarity)
+      let autoMatchStrategy: 'exhaustive' | 'window' | 'retrieval'
+      if (settings.matcherType === 'sequential') {
+        autoMatchStrategy = 'window'
+      } else if (imageCount <= 30) {
+        autoMatchStrategy = 'exhaustive'
+      } else {
+        autoMatchStrategy = 'retrieval'
+      }
+      console.log(`[COLMAP] Auto-selected match strategy: ${autoMatchStrategy} (${imageCount} images)`)
+
       try {
         const result = await extractLearnedFeatures(imagesDir, databasePath, {
           jobId,
           maxKeypoints: learnedFeaturesMaxKeypoints,
-          maxImageSize: getMaxImageSize(),
-          matchStrategy: settings.matcherType === 'sequential' ? 'window' : 'retrieval',
+          maxImageSize,
+          matchStrategy: autoMatchStrategy,
+          matchTopk: 20,
           skipVerification: false,
           onProgress: (message, phase, current, total, deviceInfo) => {
             // Features: 10-25%, Matching: 25-45%
@@ -440,7 +655,9 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
         onProgress({
           status: 'sfm_features',
           message: `DISK+LightGlue failed: ${errMsg.slice(0, 100)} - falling back to SIFT`,
-          progress: 10
+          progress: 10,
+          notification: `Learned features failed, falling back to SIFT`,
+          notificationDuration: 0
         })
         
         // Delete the database before SIFT fallback to avoid constraint errors
@@ -462,18 +679,27 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
     message: `Extracting image features (${sceneType || 'auto'} mode)...`,
     progress: 10
   })
+  
+  // Log sample image files to verify they exist
+  const imageFiles = await fs.readdir(imagesDir)
+  console.log(`[COLMAP] Found ${imageFiles.length} images in ${imagesDir}`)
+  if (imageFiles.length > 0) {
+    console.log(`[COLMAP] First image: ${imageFiles[0]}`)
+  }
 
   const featureArgs = [
     '--database_path', databasePath,
     '--image_path', imagesDir,
     '--ImageReader.single_camera', '1',
     '--ImageReader.camera_model', 'SIMPLE_RADIAL',
-    '--SiftExtraction.max_image_size', getMaxImageSize().toString(),
+    '--SiftExtraction.max_image_size', maxImageSize.toString(),
     '--SiftExtraction.max_num_features', (settings.siftMaxFeatures * 2).toString(),
     '--SiftExtraction.first_octave', settings.siftFirstOctave.toString(),
     '--SiftExtraction.peak_threshold', settings.siftPeakThreshold.toString(),
     '--SiftExtraction.edge_threshold', settings.siftEdgeThreshold.toString(),
   ]
+  
+  console.log('[COLMAP] Feature extraction: Using COLMAP defaults (older build detected)')
 
   // Add optional feature extraction settings
   if (settings.siftDomainSizePooling) {
@@ -513,39 +739,107 @@ export async function runColmapPipeline(options: ColmapOptions): Promise<ColmapR
       }
     }, jobId)
   } else {
-    // Exhaustive matching - compares all pairs
-    // Scale block_size based on image count to avoid GPU memory crashes
+    // Count images to pick the best matching strategy
     const imageFiles = await fs.readdir(imagesDir)
     const imageCount = imageFiles.filter(f => /\.(jpg|jpeg|png|bmp|tif|tiff)$/i.test(f)).length
-    const blockSize = imageCount > 200 ? 25 : imageCount > 100 ? 50 : 100
-    console.log(`[COLMAP] Exhaustive matching: ${imageCount} images, block_size=${blockSize}`)
 
-    try {
-      await runColmap('exhaustive_matcher', [
-        '--database_path', databasePath,
-        '--ExhaustiveMatching.block_size', blockSize.toString(),
-      ], (line) => {
-        if (line.includes('Matching')) {
-          onProgress({ message: `Feature matching: ${line}` })
-        }
-      }, jobId)
-    } catch (gpuErr) {
-      // GPU matching crashed - retry on CPU
-      console.warn(`[COLMAP] GPU exhaustive matching failed, retrying with CPU: ${gpuErr}`)
+    if (imageCount > 30) {
+      // Vocab tree matching - O(n) vs O(n²), much faster for large sets
+      // COLMAP 3.12+ auto-downloads the vocabulary tree from the default URL
+      console.log(`[COLMAP] Vocab tree matching: ${imageCount} images (faster than exhaustive)`)
       onProgress({
         status: 'sfm_matching',
-        message: 'GPU matching failed, retrying on CPU...',
+        message: `Vocab tree matching (${imageCount} images)...`,
         progress: 30
       })
 
-      await runColmap('exhaustive_matcher', [
+      try {
+        await runColmap('vocab_tree_matcher', [
+          '--database_path', databasePath,
+          '--VocabTreeMatching.num_images', Math.min(imageCount, 100).toString(),
+          '--VocabTreeMatching.num_nearest_neighbors', '5',
+        ], (line) => {
+          if (line.includes('Matching') || line.includes('Retriev')) {
+            onProgress({ message: `Vocab tree matching: ${line}` })
+          }
+        }, jobId)
+      } catch (vtErr) {
+        // Vocab tree failed (maybe can't download tree), fall back to exhaustive
+        console.warn(`[COLMAP] Vocab tree matching failed, falling back to exhaustive: ${vtErr}`)
+        onProgress({
+          status: 'sfm_matching',
+          message: 'Vocab tree failed, using exhaustive matching...',
+          progress: 30,
+          notification: 'Vocab tree matching failed, using exhaustive matching',
+          notificationDuration: 2600
+        })
+
+        const blockSize = imageCount > 200 ? 25 : imageCount > 100 ? 50 : 100
+        await runColmap('exhaustive_matcher', [
+          '--database_path', databasePath,
+          '--ExhaustiveMatching.block_size', blockSize.toString(),
+        ], (line) => {
+          if (line.includes('Matching')) {
+            onProgress({ message: `Feature matching: ${line}` })
+          }
+        }, jobId)
+      }
+    } else {
+      // Exhaustive matching - fine for small image sets
+      const blockSize = 100
+      console.log(`[COLMAP] Exhaustive matching: ${imageCount} images, block_size=${blockSize}`)
+
+      try {
+        await runColmap('exhaustive_matcher', [
+          '--database_path', databasePath,
+          '--ExhaustiveMatching.block_size', blockSize.toString(),
+        ], (line) => {
+          if (line.includes('Matching')) {
+            onProgress({ message: `Feature matching: ${line}` })
+          }
+        }, jobId)
+      } catch (gpuErr) {
+        // GPU matching crashed - retry on CPU
+        console.warn(`[COLMAP] GPU exhaustive matching failed, retrying with CPU: ${gpuErr}`)
+        onProgress({
+          status: 'sfm_matching',
+          message: 'GPU matching failed, retrying on CPU...',
+          progress: 30,
+          notification: 'GPU matching failed, retrying on CPU',
+          notificationDuration: 2600
+        })
+
+        await runColmap('exhaustive_matcher', [
+          '--database_path', databasePath,
+          '--ExhaustiveMatching.block_size', blockSize.toString(),
+        ], (line) => {
+          if (line.includes('Matching')) {
+            onProgress({ message: `Feature matching (CPU): ${line}` })
+          }
+        }, jobId, { CUDA_VISIBLE_DEVICES: '' })
+      }
+    }
+
+    // Spatial matching - supplement with GPS-based matches if images have location data
+    // This is fast and only helps, so we try it and ignore failures
+    try {
+      console.log('[COLMAP] Attempting spatial matching (GPS-based)...')
+      await runColmap('spatial_matcher', [
         '--database_path', databasePath,
-        '--ExhaustiveMatching.block_size', blockSize.toString(),
-      ], (line) => {
-        if (line.includes('Matching')) {
-          onProgress({ message: `Feature matching (CPU): ${line}` })
-        }
-      }, jobId, { CUDA_VISIBLE_DEVICES: '' })
+        '--SpatialMatching.max_num_neighbors', '50',
+        '--SpatialMatching.max_distance', '100',
+      ], undefined, jobId)
+      console.log('[COLMAP] Spatial matching added GPS-based matches')
+      onProgress({
+        status: 'sfm_matching',
+        message: 'Spatial matching added GPS-based matches',
+        progress: 35,
+        notification: 'GPS data found — added spatial matches',
+        notificationDuration: 2600
+      })
+    } catch {
+      // No GPS data or spatial matching failed - that's fine, it's supplementary
+      console.log('[COLMAP] Spatial matching skipped (no GPS data or not applicable)')
     }
   }
 

@@ -41,6 +41,10 @@ export const useVideoFrameStore = defineStore('videoFrame', () => {
   const isExtracting = ref(false)
   const extractionProgress = ref(0)
   
+  // Frame extraction options
+  const sharpFrameSelection = ref(true)
+  const sharpnessWindowSize = ref(5)
+  
   // Computed
   const hasVideo = computed(() => videoFile.value !== null && isVideoLoaded.value)
   
@@ -244,6 +248,14 @@ export const useVideoFrameStore = defineStore('videoFrame', () => {
     extractionProgress.value = progress
   }
   
+  function setSharpFrameSelection(enabled: boolean) {
+    sharpFrameSelection.value = enabled
+  }
+  
+  function setSharpnessWindowSize(size: number) {
+    sharpnessWindowSize.value = size
+  }
+  
   // Full reset
   function reset() {
     if (videoUrl.value) {
@@ -300,6 +312,8 @@ export const useVideoFrameStore = defineStore('videoFrame', () => {
     isModalOpen,
     isExtracting,
     extractionProgress,
+    sharpFrameSelection,
+    sharpnessWindowSize,
     
     // Computed
     hasVideo,
@@ -332,6 +346,8 @@ export const useVideoFrameStore = defineStore('videoFrame', () => {
     closeModal,
     setExtracting,
     setExtractionProgress,
+    setSharpFrameSelection,
+    setSharpnessWindowSize,
     reset,
     clearSelections
   }

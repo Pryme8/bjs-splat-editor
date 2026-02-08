@@ -3649,8 +3649,20 @@ export function useBabylon() {
       
       // NOW dispose the old mesh (after new one is ready) to avoid flicker
       if (oldSplat) {
-        console.log('[Babylon] Disposing previous splat mesh for', objectId)
+        const oldSplatCount = oldSplat.getTotalVertices()
+        console.log(`[Babylon] Disposing previous splat mesh for ${objectId} (${oldSplatCount} splats)`)
+        
+        // Dispose the mesh and all its resources
         oldSplat.dispose()
+        
+        console.log(`[Babylon] ✓ Previous splat disposed, current scene meshes: ${scene?.meshes.length || 0}`)
+        
+        // Force immediate cleanup of disposed resources
+        if (engine) {
+          engine.wipeCaches(true)  // Force wipe including bind groups
+        }
+      } else {
+        console.log('[Babylon] No previous splat to dispose for', objectId)
       }
       
       // Store the new splat in the map

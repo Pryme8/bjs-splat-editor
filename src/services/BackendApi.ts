@@ -89,6 +89,8 @@ type ProgressCallback = (progress: {
   colmapPreviewReady?: boolean
   deviceType?: 'gpu' | 'cpu'
   deviceName?: string
+  notification?: string
+  notificationDuration?: number
 }) => void
 
 // Console message types
@@ -357,7 +359,9 @@ class BackendApiService {
                 intermediateReady: data.intermediateReady,
                 colmapPreviewReady: data.colmapPreviewReady,
                 deviceType: data.deviceType,
-                deviceName: data.deviceName
+                deviceName: data.deviceName,
+                notification: data.notification,
+                notificationDuration: data.notificationDuration
               })).catch(err => {
                 console.error('[BackendApi] Progress callback error:', err)
               })

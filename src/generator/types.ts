@@ -105,6 +105,37 @@ export const TrainerEngineDescriptions: Record<TrainerEngine, string> = {
 }
 
 /**
+ * Quality preset for one-click speed vs quality tradeoff
+ */
+export type QualityPreset = 'fast' | 'balanced' | 'high' | 'custom'
+
+export const QualityPresetLabels: Record<QualityPreset, string> = {
+  fast: 'Fast',
+  balanced: 'Balanced',
+  high: 'High',
+  custom: 'Custom'
+}
+
+export const QualityPresetDescriptions: Record<QualityPreset, string> = {
+  fast: 'Quick preview, lower quality (~7k iterations)',
+  balanced: 'Good quality, reasonable speed (~15k iterations)',
+  high: 'Best quality, slower (~30k iterations)',
+  custom: 'Manual control over all settings'
+}
+
+export interface QualityPresetConfig {
+  iterations: number
+  resolution: number
+  shDegree: number
+}
+
+export const QualityPresetConfigs: Record<Exclude<QualityPreset, 'custom'>, QualityPresetConfig> = {
+  fast: { iterations: 7000, resolution: 768, shDegree: 0 },
+  balanced: { iterations: 15000, resolution: 1024, shDegree: 0 },
+  high: { iterations: 30000, resolution: 1536, shDegree: 3 }
+}
+
+/**
  * Generation configuration
  */
 export interface GenerationConfig {
@@ -136,7 +167,7 @@ export interface GenerationConfig {
 }
 
 export const DefaultConfig: GenerationConfig = {
-  iterations: 30000,  // OpenSplat default - more iterations = more splats
+  iterations: 15000,
   resolution: 1024,
   learningRate: 0.0016,
   initialSplatCount: 2000,
@@ -151,12 +182,12 @@ export const DefaultConfig: GenerationConfig = {
   cleanupMinOpacity: 0.05,
   cleanupMaxScalePercentile: 99,
   cleanupSorStdDevs: 3.0,
-  // AI Enhancement defaults (disabled by default, requires Python setup)
+  // AI Enhancement defaults
   depthEstimationEnabled: false,
   depthModelSize: 'small',
   depthFloaterFilterEnabled: true,
   depthFloaterThreshold: 0.15,
-  // Learned features defaults
+  // Learned features defaults (opt-in feature, auto-falls back to SIFT if unavailable)
   learnedFeaturesEnabled: false,
   learnedFeaturesMaxKeypoints: 2048,
   // Trainer engine

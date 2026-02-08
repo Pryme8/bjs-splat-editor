@@ -95,7 +95,7 @@ export async function extractLearnedFeatures(
   config: LearnedFeaturesConfig = {}
 ): Promise<LearnedFeaturesResult> {
   const {
-    maxKeypoints = 2048,
+    maxKeypoints = 4096,
     maxImageSize = 1600,
     sequentialMatching = false,
     matchStrategy,

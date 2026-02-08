@@ -25,6 +25,7 @@ export type DepthModelSize = 'small' | 'base' | 'large'
 export interface DepthEstimationConfig {
   modelSize?: DepthModelSize
   saveVisualization?: boolean
+  batchSize?: number  // 0 = auto-detect based on GPU memory
 }
 
 export interface DepthResult {
@@ -124,7 +125,8 @@ export async function estimateDepth(
 ): Promise<DepthSummary> {
   const {
     modelSize = 'small',
-    saveVisualization = true
+    saveVisualization = true,
+    batchSize = 0
   } = config
   
   // Ensure output directory exists
@@ -136,6 +138,7 @@ export async function estimateDepth(
       '--input_dir', inputDir,
       '--output_dir', outputDir,
       '--model', modelSize,
+      '--batch_size', batchSize.toString(),
       '--json'
     ]
     

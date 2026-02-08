@@ -5,6 +5,7 @@ import AppSidebar from './components/layout/AppSidebar.vue'
 import AppRightPanel from './components/layout/AppRightPanel.vue'
 import AppCanvas from './components/layout/AppCanvas.vue'
 import ConsolePanel from './components/panels/ConsolePanel.vue'
+import NotificationStack from './components/layout/NotificationStack.vue'
 import { useSplatEditor } from './composables/useSplatEditor'
 import { useAppStore } from './stores/appStore'
 import { useBabylon } from './composables/useBabylon'
@@ -165,6 +166,8 @@ onUnmounted(() => {
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <NotificationStack />
   </v-app>
 </template>
 

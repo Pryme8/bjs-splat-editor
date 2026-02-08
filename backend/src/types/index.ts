@@ -90,6 +90,8 @@ export interface JobProgress {
   colmapPreviewReady?: boolean  // Signals COLMAP data is available for preview
   deviceType?: DeviceType  // Current processing device (GPU or CPU)
   deviceName?: string  // Device name for tooltip (e.g., "NVIDIA RTX 4090")
+  notification?: string  // If set, shows a toast notification with this message
+  notificationDuration?: number  // Duration in ms (default 2600, 0 = click to dismiss)
 }
 
 export interface Point3D {

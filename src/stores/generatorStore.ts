@@ -2,10 +2,11 @@ import { defineStore } from 'pinia'
 import { ref, computed, watch } from 'vue'
 import { BackendApi, type JobConfig as BackendJobConfig } from '@/services/BackendApi'
 import { GetGeneratorService, type GenerationResult } from '@/generator/GeneratorService'
-import type { GenerationConfig, GenerationProgress, GenerationStage } from '@/generator/types'
-import { DefaultConfig } from '@/generator/types'
+import type { GenerationConfig, GenerationProgress, GenerationStage, QualityPreset } from '@/generator/types'
+import { DefaultConfig, QualityPresetConfigs } from '@/generator/types'
 import { useAppStore } from './appStore'
 import { useSceneStore } from './sceneStore'
+import { useNotificationStore } from './notificationStore'
 import { useBabylon } from '@/composables/useBabylon'
 
 export type GeneratorMode = 'backend' | 'browser' | 'auto'
@@ -15,6 +16,7 @@ export const useGeneratorStore = defineStore('generator', () => {
 
   // State
   const images = ref<File[]>([])
+  const qualityPreset = ref<QualityPreset>('balanced')
   const config = ref<GenerationConfig>({ ...DefaultConfig })
   const progress = ref<GenerationProgress | null>(null)
   const result = ref<GenerationResult | null>(null)
@@ -31,7 +33,7 @@ export const useGeneratorStore = defineStore('generator', () => {
   const intermediateResult = ref<{ blob: Blob; iteration: number } | null>(null)
   const lastIntermediateIteration = ref<number>(0)
   const lastIntermediateFetchTime = ref<number>(0)
-  const INTERMEDIATE_THROTTLE_MS = 5000  // Only load a new preview every 5 seconds max
+  const INTERMEDIATE_THROTTLE_MS = 2000  // Only load a new preview every 2 seconds max
   
   // COLMAP preview state
   const colmapPreviewFetched = ref(false)
@@ -54,9 +56,10 @@ export const useGeneratorStore = defineStore('generator', () => {
         console.log('[GeneratorStore] Skipping intermediate load - generation already ended:', stage)
         return
       }
-      console.log('[GeneratorStore] Loading intermediate result into viewer, iteration:', newResult.iteration)
+      console.log('[GeneratorStore] Loading intermediate result into viewer, iteration:', newResult.iteration, 'blob size:', newResult.blob.size, 'bytes')
       const appStore = useAppStore()
       await appStore.loadFromBlob(newResult.blob, `preview_${newResult.iteration}.ply`)
+      console.log('[GeneratorStore] ✓ Intermediate result loaded successfully')
     }
   })
 
@@ -179,6 +182,18 @@ export const useGeneratorStore = defineStore('generator', () => {
     config.value = { ...config.value, ...updates }
   }
 
+  function applyPreset(preset: QualityPreset) {
+    qualityPreset.value = preset
+    if (preset !== 'custom') {
+      const presetConfig = QualityPresetConfigs[preset]
+      updateConfig({
+        iterations: presetConfig.iterations,
+        resolution: presetConfig.resolution,
+        shDegree: presetConfig.shDegree
+      })
+    }
+  }
+
   function setGeneratorMode(mode: GeneratorMode) {
     generatorMode.value = mode
   }
@@ -252,6 +267,12 @@ export const useGeneratorStore = defineStore('generator', () => {
       BackendApi.SubscribeToJob(response.jobId, async (p) => {
         console.log('[GeneratorStore] Received progress update:', p.status, p.progress, p.message)
         
+        // Show toast notification if the backend flagged one
+        if (p.notification) {
+          const notifStore = useNotificationStore()
+          notifStore.Push(p.notification, p.notificationDuration ?? 2600)
+        }
+
         // Update device info if provided
         if (p.deviceType) {
           currentDeviceType.value = p.deviceType
@@ -727,6 +748,7 @@ export const useGeneratorStore = defineStore('generator', () => {
     currentJobId,
     generatorMode,
     trainingMode,
+    qualityPreset,
     intermediateResult,
     currentDeviceType,
     currentDeviceName,
@@ -748,6 +770,7 @@ export const useGeneratorStore = defineStore('generator', () => {
     removeImage,
     clearImages,
     updateConfig,
+    applyPreset,
     setGeneratorMode,
     setTrainingMode,
     startGeneration,

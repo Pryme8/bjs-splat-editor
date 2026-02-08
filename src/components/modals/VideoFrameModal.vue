@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useVideoFrameStore } from '@/stores/videoFrameStore'
+import { useGeneratorStore } from '@/stores/generatorStore'
 import { useFrameExtraction } from '@/composables/useFrameExtraction'
 import TimelineEditor from '@/components/editors/TimelineEditor.vue'
 
@@ -10,6 +11,7 @@ const emit = defineEmits<{
 }>()
 
 const store = useVideoFrameStore()
+const generatorStore = useGeneratorStore()
 const frameExtraction = useFrameExtraction()
 
 const videoRef = ref<HTMLVideoElement | null>(null)
@@ -34,6 +36,14 @@ const currentTimeFormatted = computed(() => {
 
 const durationFormatted = computed(() => {
   return formatTime(store.videoDuration)
+})
+
+const targetResolution = computed(() => {
+  return generatorStore.config.resolution || 1024
+})
+
+const targetResolutionText = computed(() => {
+  return `${targetResolution.value}px max`
 })
 
 // Format time as MM:SS
@@ -118,6 +128,9 @@ async function exportFrames() {
     const files = await frameExtraction.extractAllFromStore(videoRef.value, {
       quality: 1.0,
       format: 'image/png',
+      maxResolution: generatorStore.config.resolution,
+      sharpFrameSelection: store.sharpFrameSelection,
+      sharpnessWindowSize: store.sharpnessWindowSize,
       onProgress: (current, total) => {
         console.log(`Extracting frame ${current}/${total}`)
       }
@@ -367,6 +380,70 @@ watch(() => store.isPlaying, (playing) => {
               </div>
             </div>
           </div>
+          
+          <!-- Export settings -->
+          <div class="settings-section">
+            <div class="settings-group">
+              <span class="section-label">Export Settings:</span>
+              <div class="settings-content">
+                <div class="setting-item">
+                  <v-icon size="small" class="mr-1">mdi-resize</v-icon>
+                  <span class="text-secondary">Resolution:</span>
+                  <span class="mono ml-1">{{ targetResolutionText }}</span>
+                </div>
+                
+                <v-divider vertical class="mx-2" />
+                
+                <div class="setting-item">
+                  <v-checkbox
+                    :model-value="store.sharpFrameSelection"
+                    @update:model-value="store.setSharpFrameSelection"
+                    density="compact"
+                    hide-details
+                    class="mr-2"
+                  >
+                    <template #label>
+                      <div class="d-flex align-center">
+                        <v-icon size="small" class="mr-1">mdi-image-filter-center-focus</v-icon>
+                        <span>Smart frame selection</span>
+                        <v-tooltip location="top">
+                          <template #activator="{ props }">
+                            <v-icon 
+                              size="x-small" 
+                              class="ml-1 text-secondary"
+                              v-bind="props"
+                            >
+                              mdi-information
+                            </v-icon>
+                          </template>
+                          <span>Analyzes nearby frames and picks the sharpest one</span>
+                        </v-tooltip>
+                      </div>
+                    </template>
+                  </v-checkbox>
+                  
+                  <v-select
+                    v-if="store.sharpFrameSelection"
+                    :model-value="store.sharpnessWindowSize"
+                    @update:model-value="store.setSharpnessWindowSize"
+                    :items="[3, 5, 7, 9]"
+                    density="compact"
+                    variant="outlined"
+                    hide-details
+                    class="window-size-select"
+                    prefix="Window:"
+                  >
+                    <template #item="{ props, item }">
+                      <v-list-item v-bind="props" :title="`${item.value} frames`" />
+                    </template>
+                    <template #selection="{ item }">
+                      <span>{{ item.value }}</span>
+                    </template>
+                  </v-select>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
         
         <!-- Footer -->
@@ -410,7 +487,11 @@ watch(() => store.isPlaying, (playing) => {
             >
               <span class="mono">{{ Math.round(store.extractionProgress) }}%</span>
             </v-progress-circular>
-            <p class="mt-4">Extracting frames...</p>
+            <p class="mt-4">
+              {{ store.extractionProgress < 50 && store.sharpFrameSelection 
+                ? 'Analyzing frame sharpness...' 
+                : 'Extracting frames...' }}
+            </p>
           </div>
         </div>
       </div>
@@ -577,6 +658,43 @@ $accent-primary: #6B8AFF;
       display: flex;
       align-items: center;
       font-size: 0.875rem;
+    }
+  }
+}
+
+.settings-section {
+  padding: 8px 16px;
+  background: $background-elevated;
+  border-radius: 8px;
+  
+  .settings-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    
+    .section-label {
+      font-size: 0.75rem;
+      color: $text-secondary;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    
+    .settings-content {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      
+      .setting-item {
+        display: flex;
+        align-items: center;
+        font-size: 0.875rem;
+        
+        .window-size-select {
+          width: 120px;
+          margin-left: 8px;
+        }
+      }
     }
   }
 }

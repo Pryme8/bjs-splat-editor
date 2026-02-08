@@ -44,21 +44,22 @@ interface QualityPreset {
 }
 
 const QualityPresets: Record<string, QualityPreset> = {
-  // All presets use OpenSplat defaults - full resolution for best quality
+  // Fast: Aggressive settings for quick preview, ~7k iterations
   fast: {
-    densifyGradThresh: 0.0002,
-    densifyUntilIter: 15000,
-    refineEvery: 100,
+    densifyGradThresh: 0.0003,
+    densifyUntilIter: 5000,
+    refineEvery: 200,
     resetAlphaEvery: 30,
     ssimWeight: 0.2,
-    shDegree: 3,
-    numDownscales: 2,
-    resolutionSchedule: 3000,
-    downscaleFactor: 1
+    shDegree: 2,
+    numDownscales: 3,
+    resolutionSchedule: 2000,
+    downscaleFactor: 2
   },
+  // Medium: Balanced quality/speed, ~15k iterations (default)
   medium: {
     densifyGradThresh: 0.0002,
-    densifyUntilIter: 15000,
+    densifyUntilIter: 12000,
     refineEvery: 100,
     resetAlphaEvery: 30,
     ssimWeight: 0.2,
@@ -67,6 +68,7 @@ const QualityPresets: Record<string, QualityPreset> = {
     resolutionSchedule: 3000,
     downscaleFactor: 1
   },
+  // High: Full quality, 20k+ iterations
   high: {
     densifyGradThresh: 0.0002,
     densifyUntilIter: 15000,
@@ -109,6 +111,23 @@ export async function findLatestIntermediate(outputDir: string): Promise<string 
     // Directory might not exist yet
   }
   return null
+}
+
+/**
+ * Delete all intermediate PLY files except the latest one.
+ * Runs in the background — fire and forget.
+ */
+export function cleanupOldIntermediates(outputDir: string, keepFile: string): void {
+  fs.readdir(outputDir).then(files => {
+    const keepName = path.basename(keepFile)
+    const oldFiles = files.filter(f => f.match(/^result_\d+\.ply$/) && f !== keepName)
+    for (const f of oldFiles) {
+      fs.unlink(path.join(outputDir, f)).catch(() => {})
+    }
+    if (oldFiles.length > 0) {
+      console.log(`[OpenSplat] Cleaned up ${oldFiles.length} old intermediate file(s)`)
+    }
+  }).catch(() => {})
 }
 
 interface OpenSplatOptions {
@@ -251,9 +270,9 @@ export async function trainWithOpenSplat(
   const outputSplat = path.join(outputDir, 'result.splat')
 
   // Build OpenSplat command arguments
-  const iterations = config.iterations || 30000  // OpenSplat default
-  // Save intermediate results every 10% of iterations for live preview (~10 checkpoints)
-  const saveEvery = Math.max(100, Math.floor(iterations * 0.1))
+  const iterations = config.iterations || 15000
+  // Save intermediate results every 500 iterations for live preview
+  const saveEvery = 500
   
   // Get quality preset based on iteration count
   const quality = getQualityPreset(iterations)
@@ -287,7 +306,7 @@ export async function trainWithOpenSplat(
   }
   
   console.log(`[OpenSplat] Quality preset: densifyGradThresh=${quality.densifyGradThresh}, downscale=${quality.downscaleFactor}`)
-  console.log(`[OpenSplat] Will save intermediate results every ${saveEvery} iterations (${Math.round(saveEvery / iterations * 100)}%)`)
+  console.log(`[OpenSplat] Will save intermediate results every ${saveEvery} iterations`)
 
   // Add image path if different from default
   if (imagesDir !== path.join(colmapProjectDir, 'images')) {

@@ -807,8 +807,8 @@ def main():
         help="Output COLMAP database path"
     )
     parser.add_argument(
-        "--max_keypoints", type=int, default=2048,
-        help="Maximum keypoints per image (default: 2048)"
+        "--max_keypoints", type=int, default=4096,
+        help="Maximum keypoints per image (default: 4096)"
     )
     parser.add_argument(
         "--max_image_size", type=int, default=1600,

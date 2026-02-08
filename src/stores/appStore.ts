@@ -64,6 +64,7 @@ export const useAppStore = defineStore('app', () => {
   async function loadFromBlob(blob: Blob, name: string = 'preview.ply', isPreview: boolean = true, skipFlipPrompt: boolean = false) {
     // Revoke previous URL if exists
     if (currentFile.value?.url) {
+      console.log('[AppStore] Revoking previous blob URL:', currentFile.value.name)
       URL.revokeObjectURL(currentFile.value.url)
     }
 
@@ -79,7 +80,7 @@ export const useAppStore = defineStore('app', () => {
       skipFlipPrompt
     }
     
-    console.log('[AppStore] Loaded blob as', name, 'size:', blob.size, 'isPreview:', isPreview, 'skipFlipPrompt:', skipFlipPrompt)
+    console.log('[AppStore] Created new blob URL:', name, 'size:', blob.size, 'bytes, isPreview:', isPreview)
   }
 
   function setCurrentFile(file: SplatFile) {
